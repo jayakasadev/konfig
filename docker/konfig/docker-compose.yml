@@ -48,7 +48,7 @@ services:
 
   mongodb1:
     container_name: mongodb1
-    image: "bazel/docker/mongodb:6"
+    image: "bazel/docker/mongodb:7"
     expose:
       - 27017
     ports:
@@ -80,7 +80,7 @@ services:
 
   mongodb2:
     container_name: mongodb2
-    image: "bazel/docker/mongodb:6"
+    image: "bazel/docker/mongodb:7"
     expose:
       - 27017
     ports:
@@ -112,7 +112,7 @@ services:
 
   mongodb3:
     container_name: mongodb3
-    image: "bazel/docker/mongodb:6"
+    image: "bazel/docker/mongodb:7"
     expose:
       - 27017
     ports:
@@ -143,7 +143,7 @@ services:
       - konfig
 
   setup_replicas:
-    image: "bazel/docker/mongodb:6"
+    image: "bazel/docker/mongodb:7"
     restart: no
     container_name: setup_replicas
     environment:
