@@ -1,5 +1,5 @@
 load("@rules_proto//proto:defs.bzl", "proto_descriptor_set", "proto_library")
-load("@rules_proto_grpc//grpc-gateway:defs.bzl", "gateway_grpc_library")
+load("@rules_proto_grpc_go//:defs.bzl", "go_grpc_library")
 
 filegroup(
     name = "srcs",
@@ -13,9 +13,9 @@ proto_library(
     visibility = ["//visibility:public"],
     deps = [
         "//proto/konfig/v0/common:proto",
-        "@com_google_protobuf//:empty_proto",
-        "@com_google_protobuf//:timestamp_proto",
-        "@go_googleapis//google/api:annotations_proto",
+        "@googleapis//google/api:annotations_proto",
+        "@protobuf//:empty_proto",
+        "@protobuf//:timestamp_proto",
     ],
 )
 
@@ -23,19 +23,19 @@ proto_descriptor_set(
     name = "descriptor_set",
     deps = [
         ":proto",
-        "@go_googleapis//google/api:annotations_proto",
+        "@googleapis//google/api:annotations_proto",
     ],
 )
 
-gateway_grpc_library(
-    name = "service",
+go_grpc_library(
+    name = "go_default_library",
     importpath = "capitalintent.com/konfig/protos/v0/service",
-    options = {
-        "@rules_proto_grpc//grpc-gateway:grpc_gateway_plugin": ["allow_delete_body=true"],
-    },
+    #    options = {
+    #        "@rules_proto_grpc//grpc-gateway:grpc_gateway_plugin": ["allow_delete_body=true"],
+    #    },
     protos = [":proto"],
     visibility = ["//visibility:public"],
     deps = [
-        "//proto/konfig/v0/common",
+        "//proto/konfig/v0/common:go_default_library",
     ],
 )

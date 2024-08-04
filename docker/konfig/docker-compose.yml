@@ -1,7 +1,7 @@
 version: "3"
 services:
   konfig-server:
-    image: "bazel/go/konfig/src/main/app:konfig"
+    image: "bazel/go/konfig/app:konfig"
     platform: linux/x86_64
     container_name: konfig-server
     environment:
@@ -24,7 +24,7 @@ services:
       - konfig
 
   konfig-proxy:
-    image: "bazel/go/konfig/src/main/proxy:konfig_proxy"
+    image: "bazel/go/konfig/proxy:konfig_proxy"
     platform: linux/x86_64
     container_name: konfig-proxy
     environment:

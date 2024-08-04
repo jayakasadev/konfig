@@ -1,5 +1,5 @@
 load("@rules_proto//proto:defs.bzl", "proto_library")
-load("@rules_proto_grpc//go:defs.bzl", "go_grpc_library")
+load("@rules_proto_grpc_go//:defs.bzl", "go_grpc_library")
 
 filegroup(
     name = "srcs",
@@ -13,12 +13,12 @@ proto_library(
     visibility = ["//proto/konfig:__subpackages__"],
     deps = [
         "//proto/common:proto",
-        "@com_google_protobuf//:timestamp_proto",
+        "@protobuf//:timestamp_proto",
     ],
 )
 
 go_grpc_library(
-    name = "common",
+    name = "go_default_library",
     importpath = "capitalintent.com/konfig/protos/v0/common",
     protos = [":proto"],
     visibility = ["//visibility:public"],

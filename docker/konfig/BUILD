@@ -17,8 +17,8 @@ docker_compose(
         ":data_deps",
     ],
     images = [
-        "//go/konfig/src/main/app:konfig",
-        "//go/konfig/src/main/proxy:konfig_proxy",
+        "//go/konfig/app:konfig",
+        "//go/konfig/proxy:konfig_proxy",
         "//docker/mongodb:6",
     ],
     project = "konfig",

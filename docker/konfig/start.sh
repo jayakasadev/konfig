@@ -2,10 +2,10 @@
 set -eux
 
 echo "Building konfig proxy"
-bazelisk run //go/konfig/src/main/proxy:konfig_proxy
+bazelisk run //go/konfig/proxy:konfig_proxy
 
 echo "Building konfig server"
-bazelisk run //go/konfig/src/main/app:konfig
+bazelisk run //go/konfig/app:konfig
 
 echo "Building konfig server"
 bazelisk run //docker/mongodb:6
