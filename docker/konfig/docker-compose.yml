@@ -22,7 +22,6 @@ services:
           memory: 512M
     networks:
       - konfig
-
   konfig-proxy:
     image: "bazel/go/konfig/proxy:konfig_proxy"
     platform: linux/x86_64
@@ -45,7 +44,6 @@ services:
           memory: 512M
     networks:
       - konfig
-
   mongodb1:
     container_name: mongodb1
     image: "bazel/docker/mongodb:7"
@@ -77,7 +75,6 @@ services:
     restart: always
     networks:
       - konfig
-
   mongodb2:
     container_name: mongodb2
     image: "bazel/docker/mongodb:7"
@@ -109,7 +106,6 @@ services:
     restart: always
     networks:
       - konfig
-
   mongodb3:
     container_name: mongodb3
     image: "bazel/docker/mongodb:7"
@@ -141,7 +137,6 @@ services:
     restart: always
     networks:
       - konfig
-
   setup_replicas:
     image: "bazel/docker/mongodb:7"
     restart: no
@@ -165,7 +160,6 @@ services:
       - /scripts/init.sh
     networks:
       - konfig
-
   mongo-express:
     container_name: mongo-express
     image: mongo-express
@@ -182,7 +176,6 @@ services:
         condition: service_completed_successfully
     networks:
       - konfig
-
 volumes:
   mongodb1:
     driver: local
@@ -190,7 +183,6 @@ volumes:
     driver: local
   mongodb3:
     driver: local
-
 networks:
   konfig:
     driver: bridge

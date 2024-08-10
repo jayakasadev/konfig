@@ -2,23 +2,22 @@
 
 echo "###### Waiting for mongodb1 instance startup.."
 until mongosh --host mongodb1:27017 --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)' &>/dev/null; do
-  printf '.'
-  sleep 1
+	printf '.'
+	sleep 1
 done
 echo "###### Working mongodb1 instance found, initiating user setup & initializing rs setup.."
 
 echo "###### Waiting for mongodb2 instance startup.."
 until mongosh --host mongodb2:27017 --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)' &>/dev/null; do
-  printf '.'
-  sleep 1
+	printf '.'
+	sleep 1
 done
 echo "###### Working mongodb2 instance found, initiating user setup & initializing rs setup.."
 
-
 echo "###### Waiting for mongodb3 instance startup.."
 until mongosh --host mongodb3:27017 --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)' &>/dev/null; do
-  printf '.'
-  sleep 1
+	printf '.'
+	sleep 1
 done
 echo "###### Working mongodb3 instance found, initiating user setup & initializing rs setup.."
 
