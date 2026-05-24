@@ -1,0 +1,55 @@
+name: Konfig K8s Integration Tests
+# Runs the `integration_watcher` test suite using Testcontainers (K3s in Docker).
+# No external kind cluster or kubectl context is required — each test spins up
+# its own K3s container and tears it down automatically.
+# Triggered on every PR that touches rust/konfig/ or this workflow file.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/konfig/**'
+      - 'schema/konfig/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  k8s-integration:
+    name: Watcher integration (Testcontainers K3s)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Restore Cargo registry + compiled deps to keep the job fast.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: cargo-konfig-k8s-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-konfig-k8s-
+
+      # Run the watcher integration tests with the `integration` feature enabled.
+      # Testcontainers pulls and starts a K3s container automatically — Docker is
+      # pre-installed on blacksmith runners so no extra setup is needed.
+      # `--test integration_watcher` targets only that file; no other tests run.
+      - name: Run watcher integration tests
+        run: |
+          cargo test \
+            --test integration_watcher \
+            --features integration \
+            -p konfig \
+            -- --nocapture
+        env:
+          RUST_LOG: konfig=debug,kube=info
+          # Testcontainers respects TESTCONTAINERS_RYUK_DISABLED for environments
+          # where the Ryuk reaper container is not permitted.
+          TESTCONTAINERS_RYUK_DISABLED: "false"

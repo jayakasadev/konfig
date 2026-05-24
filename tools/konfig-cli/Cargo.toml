@@ -1,0 +1,16 @@
+[package]
+name = "konfig-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "konfig-cli"
+path = "src/main.rs"
+
+[dependencies]
+bytes = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }

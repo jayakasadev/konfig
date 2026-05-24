@@ -1,0 +1,48 @@
+[package]
+name = "konfig"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+name = "konfig"
+path = "lib.rs"
+
+[features]
+# Gate K8s watcher integration tests (require a live cluster via `kind`).
+# Run with: cargo test --test integration_watcher --features integration
+integration = []
+
+[[test]]
+name = "integration_watcher"
+path = "tests/integration_watcher.rs"
+required-features = ["integration"]
+
+[dependencies]
+arc-swap = {workspace = true}
+bytes = {workspace = true}
+flatbuffers = {workspace = true}
+futures-util = "0.3"
+kube = {version = "0.98", features = ["runtime", "client"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+tokio = {workspace = true}
+tonic = {workspace = true}
+tracing = {workspace = true}
+thiserror = {workspace = true}
+
+[dev-dependencies]
+# Integration test helpers.
+tokio = {workspace = true}
+kube = {version = "0.98", features = ["runtime", "client"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+testcontainers = "0.23"
+testcontainers-modules = {version = "0.11", features = ["k3s"]}
+rustls = {version = "0.23", default-features = false}
+
+[lints.clippy]
+# std_instead_of_core and std_instead_of_alloc are only meaningful for no_std
+# crates. konfig depends on kube/tokio which require std, so these are suppressed.
+std_instead_of_core = "allow"
+std_instead_of_alloc = "allow"
