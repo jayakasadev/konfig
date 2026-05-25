@@ -11,13 +11,19 @@ name = "konfig"
 path = "lib.rs"
 
 [features]
-# Gate K8s watcher integration tests (require a live cluster via `kind`).
-# Run with: cargo test --test integration_watcher --features integration
+# Gate K8s integration tests (require a live K3s cluster via Testcontainers).
+# Run all with:  cargo test --features integration -p konfig
+# Run one with:  cargo test --test integration_watcher --features integration -p konfig
 integration = []
 
 [[test]]
 name = "integration_watcher"
 path = "tests/integration_watcher.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "integration_watch_timing"
+path = "tests/integration_watch_timing.rs"
 required-features = ["integration"]
 
 [dependencies]

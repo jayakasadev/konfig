@@ -1,14 +1,15 @@
 name: Konfig K8s Integration Tests
-# Runs the `integration_watcher` test suite using Testcontainers (K3s in Docker).
-# No external kind cluster or kubectl context is required — each test spins up
-# its own K3s container and tears it down automatically.
-# Triggered on every PR that touches rust/konfig/ or this workflow file.
+# Runs ALL konfig integration tests (files matching tests/integration_*.rs) using
+# Testcontainers (K3s in Docker).  No external kind cluster or kubectl context is
+# required — each test spins up its own K3s container and tears it down.
+# Triggered on every PR that touches rust/konfig/, schema/konfig/, or this file.
 on:
   pull_request:
     branches: [main]
     paths:
       - 'rust/konfig/**'
       - 'schema/konfig/**'
+      - '.github/workflows/konfig-k8s-integration.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -16,7 +17,7 @@ concurrency:
 
 jobs:
   k8s-integration:
-    name: Watcher integration (Testcontainers K3s)
+    name: All integration tests (Testcontainers K3s)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -37,14 +38,17 @@ jobs:
           key: cargo-konfig-k8s-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-konfig-k8s-
 
-      # Run the watcher integration tests with the `integration` feature enabled.
+      # Run ALL integration tests with the `integration` feature enabled.
       # Testcontainers pulls and starts a K3s container automatically — Docker is
       # pre-installed on blacksmith runners so no extra setup is needed.
-      # `--test integration_watcher` targets only that file; no other tests run.
-      - name: Run watcher integration tests
+      #
+      # Omitting `--test <name>` causes `cargo test` to discover and run every
+      # [[test]] target in Cargo.toml that has `required-features = ["integration"]`.
+      # New test files added in future phases (Phase 2A gRPC, Phase 2B watch stream,
+      # etc.) are picked up automatically — no workflow change required.
+      - name: Run all konfig integration tests
         run: |
           cargo test \
-            --test integration_watcher \
             --features integration \
             -p konfig \
             -- --nocapture
