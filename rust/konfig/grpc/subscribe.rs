@@ -11,6 +11,7 @@ use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
@@ -60,15 +61,14 @@ pub async fn handle_subscribe(
 
             let config_event = ConfigEvent { event_type, config: Some(snapshot_to_proto(&snap)) };
 
-            if tx.capacity() == 0 {
-                warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
-                let _ = tx.send(Err(Status::resource_exhausted("subscriber too slow"))).await;
-                break;
-            }
-
-            match tx.send(Ok(config_event)).await {
-                Ok(_) => {}
-                Err(_) => {
+            match tx.try_send(Ok(config_event)) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
+                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => {
                     info!("Subscriber disconnected — closing watch stream");
                     break;
                 }

@@ -65,6 +65,9 @@ async fn run_namespace_watcher(
             }
             Event::Delete(secret) => {
                 let name = secret.metadata.name.as_deref().unwrap_or("<unknown>");
+                // Intentionally not removing from cache on delete — CP behavior:
+                // serve stale secret rather than returning NotFound during a partition.
+                // Tracked in W4 (86ahpgaw3).
                 warn!(name, "Secret deleted — cache retains last-known-good");
             }
             Event::Init | Event::InitDone => debug!("Secret watch stream: init"),
