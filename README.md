@@ -186,6 +186,169 @@ the chart creates one `Role` + `RoleBinding` per namespace — check the rendere
 
 ---
 
+## Using existing ConfigMaps and Secrets
+
+Konfig can watch K8s-native ConfigMaps and Secrets alongside Config CRDs —
+useful for teams that already have config stored in those resources and want
+delivery without migrating to the CRD first.
+
+### Opt-in via label
+
+Both ConfigMaps and Secrets are **opt-in**. Konfig ignores any resource that
+does not have the label:
+
+```
+konfig.io/managed: "true"
+```
+
+Label an existing resource to bring it under konfig's watch:
+
+```bash
+# Label a ConfigMap
+kubectl label configmap my-app-config konfig.io/managed=true -n default
+
+# Label a Secret
+kubectl label secret my-app-secrets konfig.io/managed=true -n production
+```
+
+### ConfigMap format
+
+Konfig reads ConfigMap data in two ways:
+
+**Structured** — if `data["content"]` exists, it is parsed as a JSON or YAML
+object and stored as the `content` field (same shape as a Config CRD):
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-config
+  namespace: default
+  labels:
+    konfig.io/managed: "true"
+  annotations:
+    konfig.io/schema-version: "3"   # optional; enforces monotonicity
+data:
+  content: |
+    {
+      "risk": {
+        "max_order_size_usd": 1000,
+        "max_position_usd": 10000
+      }
+    }
+```
+
+**Flat** — if no `content` key is present, all key-value pairs are merged into
+a flat JSON object. The special key `schema_version` is extracted separately:
+
+```yaml
+data:
+  schema_version: "2"
+  max_order_size_usd: "1000"
+  max_position_usd: "10000"
+```
+
+### Secret format
+
+Secrets follow the same opt-in label. Values are stored base64-encoded on the
+wire and **never decoded server-side** — the consumer decodes them:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-credentials
+  namespace: production
+  labels:
+    konfig.io/managed: "true"
+  annotations:
+    konfig.io/schema-version: "1"
+type: Opaque
+stringData:
+  api_key: "sk-live-abc123"
+  api_secret: "supersecret"
+```
+
+The `konfig.io/schema-version` annotation is optional but enables monotonicity
+enforcement on Secret updates (same semantics as Config CRDs).
+
+### Enable watching in the Helm chart
+
+```bash
+# Watch ConfigMaps across all namespaces
+helm upgrade konfig ./chart \
+  --set konfig.watchConfigMaps=true
+
+# Watch Secrets in specific namespaces (Role + RoleBinding created per namespace)
+helm upgrade konfig ./chart \
+  --set-string "konfig.secretNamespaces=production\,staging"
+
+# Both
+helm upgrade konfig ./chart \
+  --set konfig.watchConfigMaps=true \
+  --set-string "konfig.secretNamespaces=production\,staging"
+```
+
+> **Note**: ConfigMap and Secret caches are separate from the Config CRD cache.
+> Consumers distinguish them by calling the appropriate gRPC RPC:
+> `Get` / `GetAll` for Config CRDs and ConfigMaps, `GetSecret` / `GetAllSecrets`
+> for Secrets.
+
+### Migrate an existing ConfigMap to a Config CRD
+
+If you want to graduate from a ConfigMap to the fully-featured Config CRD
+(with schema_version enforcement and the Apply RPC), use the `konfig import`
+CLI command:
+
+```bash
+# Import a labeled ConfigMap as a Config CRD
+konfig-cli import configmap \
+  --namespace default \
+  --name trading-config
+
+# Dry-run: print the generated Config CRD YAML without applying
+konfig-cli import configmap \
+  --namespace default \
+  --name trading-config \
+  --dry-run
+```
+
+This creates or patches a `Config.konfig.io/v1` object with the ConfigMap's
+content. After importing, you can remove the `konfig.io/managed` label from
+the ConfigMap and stop watching it — the Config CRD becomes the source of truth.
+
+### Reading Secrets in consumers
+
+Secret values arrive base64-encoded. Decode on the consumer side:
+
+```rust
+// via gRPC GetSecret RPC
+let secret = client.get_secret(GetSecretRequest {
+    namespace: "production".into(),
+    name: "api-credentials".into(),
+}).await?.into_inner();
+
+let data: serde_json::Value = serde_json::from_str(&secret.data_json)?;
+let api_key_b64 = data["api_key"].as_str().unwrap();
+let api_key = base64::decode(api_key_b64)?;
+let api_key_str = String::from_utf8(api_key)?;
+```
+
+The `get-secret` CLI command redacts values by default; pass `--reveal` to
+print plaintext:
+
+```bash
+konfig-cli get-secret --namespace production --name api-credentials
+# api_key: [REDACTED]
+# api_secret: [REDACTED]
+
+konfig-cli get-secret --namespace production --name api-credentials --reveal
+# api_key: sk-live-abc123
+# api_secret: supersecret
+```
+
+---
+
 ## Consumer integration
 
 ### Option A — gRPC Subscribe (multi-subscriber fan-out)
