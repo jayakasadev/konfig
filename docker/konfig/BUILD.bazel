@@ -1,2 +1,49 @@
-# Placeholder — full OCI image build is Phase 5+.
-# The Dockerfile is used directly by CI/CD (docker buildx) until then.
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
+# Build the konfig binary via cargo (not yet in the Bazel crate graph).
+# local = True runs on the host without sandbox so cargo can reach the
+# workspace root and the crate registry cache.
+genrule(
+    name = "konfig_bin",
+    srcs = ["//:Cargo.lock"],
+    outs = ["konfig"],
+    cmd = "cargo build --release -p konfig --bin konfig && cp target/release/konfig $@",
+    local = True,
+    tags = ["no-remote"],
+)
+
+# Pack the binary into a single-file layer at /.
+pkg_tar(
+    name = "konfig_layer",
+    srcs = [":konfig_bin"],
+    package_dir = "/",
+    mode = "0755",
+)
+
+# Assemble the OCI image: distroless/cc-debian12:nonroot + binary layer.
+oci_image(
+    name = "image",
+    base = "@distroless_cc",
+    tars = [":konfig_layer"],
+    entrypoint = ["/konfig"],
+    exposed_ports = [
+        "50051/tcp",
+        "9090/tcp",
+    ],
+)
+
+# Load into local docker daemon:  bazel run //docker/konfig:load
+oci_load(
+    name = "load",
+    image = ":image",
+    repo_tags = ["kasa288/konfig:latest"],
+)
+
+# Push to Docker Hub:  bazel run //docker/konfig:push
+oci_push(
+    name = "push",
+    image = ":image",
+    repository = "index.docker.io/kasa288/konfig",
+    remote_tags = ["latest"],
+)
