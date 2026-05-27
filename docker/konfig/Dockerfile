@@ -5,7 +5,7 @@ RUN apt-get update -q && apt-get install -y -q protobuf-compiler && rm -rf /var/
 COPY . .
 RUN cargo build --release -p konfig --bin konfig
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot
 COPY --from=builder /build/target/release/konfig /konfig
 EXPOSE 50051 9090
 ENTRYPOINT ["/konfig"]
