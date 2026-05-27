@@ -4,10 +4,6 @@
 //!   dial9-tokio-telemetry — nanosecond runtime traces → `dial9 serve --local-dir /tmp/dial9`
 //!   tokio-console          — live task inspector       → `tokio-console`
 //!   tracing                — structured spans/events
-//!
-//! Usage:
-//!   DIAL9_ENABLED=true DIAL9_TRACE_DIR=/tmp/dial9 \
-//!     konfig-loadtest --addr http://konfig:50051 --namespace konfig-system --config-name konfig-loadtest
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,6 +26,10 @@ const APPLY_INTERVAL_MS: u64 = 6_000;
 const DRAIN_TIMEOUT_SECS: u64 = 30;
 const DRAIN_POLL_MS: u64 = 100;
 const P99_LIMIT_MS: u128 = 1_000;
+/// Max reconnect attempts before a subscriber gives up.
+const MAX_RECONNECT_ATTEMPTS: usize = 5;
+/// Base backoff before reconnecting (doubles each attempt, capped at 2s).
+const RECONNECT_BASE_MS: u64 = 100;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -43,8 +43,6 @@ struct Args {
     #[arg(long, default_value = "coinbase-trading")]
     config_name: String,
 }
-
-// ── Telemetry config ──────────────────────────────────────────────────────────
 
 fn telemetry_config() -> dial9_tokio_telemetry::Dial9Config {
     dial9_tokio_telemetry::Dial9Config::from_env()
@@ -74,7 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let args = Args::parse();
 
-    // ── Connect ───────────────────────────────────────────────────────────────
     let channel = Channel::from_shared(args.addr.clone())
         .expect("valid URI")
         .connect()
@@ -83,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut driver = KonfigServiceClient::new(channel.clone());
 
-    // Fix 1 in server: query current schema_version so applies always succeed.
+    // Query current schema_version so applies always start above the current value.
     let current_version = match driver
         .get(tonic::Request::new(GetRequest {
             namespace: args.namespace.clone(),
@@ -108,23 +105,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // ── Shared state ──────────────────────────────────────────────────────────
+
     let latencies: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
     let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; N_SUBSCRIBERS]));
-    let apply_timestamps: Arc<Mutex<Vec<Instant>>> =
-        Arc::new(Mutex::new(Vec::with_capacity(APPLY_COUNT as usize)));
-    let successful_applies: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
-    // Fix 2: barrier — apply loop waits until ALL N_SUBSCRIBERS have an active
-    // Subscribe stream before sending the first Apply.  Eliminates the cold-
-    // start outliers that drove p99 to 6 s.
+    // Fix 1: indexed by (schema_version - start_seq) so each subscriber can
+    // look up the exact Apply return time for the event it just received.
+    let apply_timestamps: Arc<Mutex<Vec<Option<Instant>>>> =
+        Arc::new(Mutex::new(vec![None; APPLY_COUNT as usize]));
+
+    let successful_applies: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let barrier = Arc::new(Barrier::new(N_SUBSCRIBERS + 1));
 
     // ── Spawn subscribers ─────────────────────────────────────────────────────
+
     let mut sub_handles = Vec::with_capacity(N_SUBSCRIBERS);
     for sub_id in 0..N_SUBSCRIBERS {
         let handle = tokio::spawn(run_subscriber(
             sub_id,
-            channel.clone(),
+            args.addr.clone(),
             args.namespace.clone(),
             args.config_name.clone(),
             start_seq,
@@ -136,11 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         sub_handles.push(handle);
     }
 
-    // Wait until all subscribers have their Subscribe stream established.
     barrier.wait().await;
-    info!("All {} subscribers confirmed connected — starting Apply loop", N_SUBSCRIBERS);
+    info!("All {} subscribers connected — starting Apply loop", N_SUBSCRIBERS);
 
     // ── Apply loop ────────────────────────────────────────────────────────────
+
     for seq in start_seq..=end_seq {
         let yaml = format!(
             "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  load_test: true\n"
@@ -161,13 +160,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         match apply_result {
             Ok(_) => {
-                apply_timestamps.lock().await.push(Instant::now());
+                // Fix 1: store at index (seq - start_seq) for O(1) per-event lookup.
+                let idx = (seq - start_seq) as usize;
+                apply_timestamps.lock().await[idx] = Some(Instant::now());
                 *successful_applies.lock().await += 1;
                 info!(seq, "Apply RPC returned");
             }
             Err(e) => {
                 warn!(seq, "Apply RPC failed: {e}");
-                apply_timestamps.lock().await.push(Instant::now());
+                // Leave the slot None so subscribers skip latency for this apply.
             }
         }
 
@@ -183,7 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         APPLY_COUNT
     );
 
-    // Dynamic drain: wait until all expected events received or timeout.
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(DRAIN_TIMEOUT_SECS);
     loop {
         let received: u32 = event_counts.lock().await.iter().sum();
@@ -198,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for h in sub_handles { h.abort(); }
 
     // ── Report ────────────────────────────────────────────────────────────────
+
     let lat = latencies.lock().await;
     let counts = event_counts.lock().await;
 
@@ -248,65 +249,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 // ── Subscriber task ───────────────────────────────────────────────────────────
 
+/// A subscriber that reconnects on stream error with exponential backoff.
+///
+/// Fix 2: reconnect loop prevents missed events from transient stream errors
+/// (Docker Desktop network blips, brief API server unavailability).
+/// Fix 1: per-event latency uses indexed timestamp lookup by schema_version.
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip_all, fields(sub_id))]
 async fn run_subscriber(
     sub_id: usize,
-    channel: Channel,
+    addr: String,
     namespace: String,
     config_name: String,
-    // Fix 3: only count/measure events from our apply loop (schema_version >= start_seq).
-    // Filters out InitApply events that previously inflated total_received and p99.
     start_seq: u32,
     latencies: Arc<Mutex<Vec<u128>>>,
     event_counts: Arc<Mutex<Vec<u32>>>,
-    apply_timestamps: Arc<Mutex<Vec<Instant>>>,
-    // Fix 2: barrier — signal when Subscribe stream is established.
+    apply_timestamps: Arc<Mutex<Vec<Option<Instant>>>>,
     barrier: Arc<Barrier>,
 ) {
-    let mut client = KonfigServiceClient::new(channel);
-    let req = SubscribeRequest {
-        namespace,
-        names: vec![config_name],
-        resume_resource_version: String::new(),
-    };
-
-    let mut stream = match client.subscribe(tonic::Request::new(req)).await {
-        Ok(r) => r.into_inner(),
+    let channel = match Channel::from_shared(addr.clone())
+        .expect("valid URI")
+        .connect()
+        .await
+    {
+        Ok(c) => c,
         Err(e) => {
-            warn!(sub_id, "Subscribe failed: {e}");
-            barrier.wait().await; // still release the barrier to avoid deadlock
+            warn!(sub_id, "Failed to connect: {e}");
+            barrier.wait().await;
             return;
         }
     };
 
-    // Fix 2: signal that this subscriber's stream is live before the first Apply fires.
+    let mut client = KonfigServiceClient::new(channel);
+    let req = SubscribeRequest {
+        namespace: namespace.clone(),
+        names: vec![config_name.clone()],
+        resume_resource_version: String::new(),
+    };
+
+    // Establish initial stream and signal the barrier.
+    let mut stream = match client.subscribe(tonic::Request::new(req.clone())).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            warn!(sub_id, "Subscribe failed: {e}");
+            barrier.wait().await;
+            return;
+        }
+    };
+
+    // Signal: this subscriber's stream is live.
     barrier.wait().await;
 
-    while let Some(item) = stream.next().await {
-        let received_at = Instant::now();
-        match item {
-            Ok(event) => {
-                let version = event.config.as_ref().map(|c| c.schema_version).unwrap_or(0);
+    // Fix 2: track resume_resource_version for reconnects.
+    let mut last_resource_version = String::new();
+    let mut reconnect_attempt = 0usize;
 
-                // Fix 3: skip InitApply / pre-test events.
-                if version < start_seq {
-                    continue;
-                }
+    loop {
+        while let Some(item) = stream.next().await {
+            let received_at = Instant::now();
+            match item {
+                Ok(event) => {
+                    reconnect_attempt = 0; // reset on successful event
+                    let version = event.config.as_ref().map(|c| c.schema_version).unwrap_or(0);
+                    if let Some(rv) = event.config.as_ref().map(|c| &c.resource_version) {
+                        last_resource_version = rv.clone();
+                    }
 
-                let lag_ms = {
-                    let ts = apply_timestamps.lock().await;
-                    ts.last().map(|t| received_at.saturating_duration_since(*t).as_millis())
-                };
-                if let Some(ms) = lag_ms {
-                    latencies.lock().await.push(ms);
+                    // Only measure/count events from our apply loop.
+                    if version < start_seq { continue; }
+
+                    // Fix 1: precise latency — look up the exact Apply return time.
+                    let idx = (version - start_seq) as usize;
+                    let lag_ms = {
+                        let ts = apply_timestamps.lock().await;
+                        ts.get(idx)
+                            .and_then(|t| *t)
+                            .map(|t| received_at.saturating_duration_since(t).as_millis())
+                    };
+                    if let Some(ms) = lag_ms {
+                        latencies.lock().await.push(ms);
+                    }
+                    event_counts.lock().await[sub_id] += 1;
                 }
-                event_counts.lock().await[sub_id] += 1;
-            }
-            Err(e) => {
-                warn!(sub_id, "Stream error: {e}");
-                break;
+                Err(e) => {
+                    warn!(sub_id, "Stream error: {e} — reconnecting");
+                    break;
+                }
             }
         }
+
+        // Fix 2: reconnect with exponential backoff.
+        reconnect_attempt += 1;
+        if reconnect_attempt > MAX_RECONNECT_ATTEMPTS {
+            warn!(sub_id, reconnect_attempt, "Max reconnects exceeded — subscriber stopping");
+            break;
+        }
+
+        let delay_ms = (RECONNECT_BASE_MS << reconnect_attempt.min(4)).min(2_000);
+        warn!(sub_id, reconnect_attempt, delay_ms, "Reconnecting after stream error");
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+        let resume_req = SubscribeRequest {
+            namespace: namespace.clone(),
+            names: vec![config_name.clone()],
+            resume_resource_version: last_resource_version.clone(),
+        };
+        stream = match client.subscribe(tonic::Request::new(resume_req)).await {
+            Ok(r) => r.into_inner(),
+            Err(e) => {
+                warn!(sub_id, "Reconnect Subscribe failed: {e}");
+                continue; // try again next iteration
+            }
+        };
+        info!(sub_id, reconnect_attempt, "Reconnected successfully");
     }
 }
