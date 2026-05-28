@@ -1,8 +1,6 @@
 //! konfig-loadtest — 4-scenario gRPC stress test for Konfig.
 //!
 //! Profiling stack:
-//!   dial9-tokio-telemetry — nanosecond runtime traces → `dial9 serve --local-dir /tmp/dial9`
-//!   tokio-console          — live task inspector       → `tokio-console`
 //!   tracing                — structured spans/events
 //!
 //! Scenarios:
@@ -42,10 +40,6 @@ struct Args {
     /// Which scenario to run: all | subscribe | get | reconnect | secrets
     #[arg(long, default_value = "all")]
     scenario: String,
-}
-
-fn telemetry_config() -> dial9_tokio_telemetry::Dial9Config {
-    dial9_tokio_telemetry::Dial9Config::from_env()
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -135,25 +129,15 @@ async fn connect(addr: &str) -> Result<Channel, tonic::transport::Error> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[dial9_tokio_telemetry::main(config = telemetry_config)]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (console_layer, console_server) = console_subscriber::ConsoleLayer::builder()
-        .with_default_env()
-        .build();
-
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer::new())
-        .with(
-            tracing_subscriber::fmt::layer().with_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("konfig_loadtest=info".parse()?)
-                    .add_directive("konfig=info".parse()?),
-            ),
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("konfig_loadtest=info".parse()?)
+                .add_directive("konfig=info".parse()?),
         )
         .init();
-
-    tokio::spawn(console_server.serve());
 
     let args = Args::parse();
 

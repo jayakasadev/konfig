@@ -27,6 +27,9 @@ tokio = {version = "1.52.3", features = ["full"], default-features = false}
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
-console-subscriber = "0.4"
-dial9-tokio-telemetry = {version = "0.3", features = ["tracing-layer"]}
 tracing = {version = "0.1.44", features = ["attributes", "log", "async-await"]}
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
