@@ -40,7 +40,7 @@ struct Args {
     addr: String,
     #[arg(long, default_value = "default")]
     namespace: String,
-    #[arg(long, default_value = "coinbase-trading")]
+    #[arg(long, default_value = "my-config")]
     config_name: String,
 }
 
