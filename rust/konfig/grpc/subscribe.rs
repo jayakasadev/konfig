@@ -49,7 +49,7 @@ pub const REPLAY_BUFFER_SIZE: usize = 1_000;
 #[derive(Clone)]
 pub struct ReplayEntry {
     pub resource_version: String,
-    pub event: ConfigEvent,
+    pub event: Arc<ConfigEvent>,
 }
 
 /// Per-namespace replay buffer: a bounded FIFO ring of the last
@@ -57,7 +57,7 @@ pub struct ReplayEntry {
 pub type ReplayBuffer = Arc<Mutex<VecDeque<ReplayEntry>>>;
 
 /// Push `event` into `buf`, evicting the oldest entry when the buffer is full.
-fn push_replay(buf: &ReplayBuffer, resource_version: String, event: ConfigEvent) {
+fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEvent>) {
     let mut guard = buf.lock().expect("replay buffer poisoned");
     if guard.len() >= REPLAY_BUFFER_SIZE {
         guard.pop_front();
@@ -71,7 +71,7 @@ fn push_replay(buf: &ReplayBuffer, resource_version: String, event: ConfigEvent)
 pub async fn handle_subscribe(
     cache: Arc<ConfigCache>,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
@@ -120,9 +120,9 @@ pub async fn handle_subscribe(
 fn get_or_create_broadcast(
     namespace: String,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
-) -> (broadcast::Receiver<ConfigEvent>, ReplayBuffer) {
+) -> (broadcast::Receiver<Arc<ConfigEvent>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
     if let Some(sender) = namespace_broadcasts.get(&namespace) {
         let buf = namespace_replay_buffers
@@ -178,9 +178,9 @@ fn get_or_create_broadcast(
 async fn run_namespace_watcher(
     namespace: String,
     kube_client: Client,
-    tx: broadcast::Sender<ConfigEvent>,
+    tx: broadcast::Sender<Arc<ConfigEvent>>,
     replay_buf: ReplayBuffer,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
 ) {
     let ar = crate::watcher::config_api_resource();
@@ -198,14 +198,16 @@ async fn run_namespace_watcher(
             continue;
         };
         let rv = snap.resource_version.clone();
-        let config_event = ConfigEvent {
+        // Serialise once, wrap in Arc — all broadcast receivers share the same
+        // allocation; each clone is just a reference-count increment (O(1)).
+        let config_event = Arc::new(ConfigEvent {
             event_type,
             config: Some(snapshot_to_proto(&snap)),
-        };
+        });
 
         // Push into replay buffer before broadcasting so a subscriber that
         // races to read the buffer after receiving the live event will find it.
-        push_replay(&replay_buf, rv, config_event.clone());
+        push_replay(&replay_buf, rv, Arc::clone(&config_event));
 
         // `send` returns Err only when there are zero receivers — drop the event.
         let _ = tx.send(config_event);
@@ -229,19 +231,20 @@ async fn resume_from_buffer(
     replay_buf: ReplayBuffer,
     cache: Arc<ConfigCache>,
     namespace: String,
-    bcast_rx: broadcast::Receiver<ConfigEvent>,
+    bcast_rx: broadcast::Receiver<Arc<ConfigEvent>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
 ) {
     // Collect the replay slice under the lock, then release before doing I/O.
     // Also record whether resume_rv was found in the buffer.
-    let (replay_slice, found_in_buffer): (Vec<ConfigEvent>, bool) = {
+    // Arc clones are reference-count increments only — no deep copy of event data.
+    let (replay_slice, found_in_buffer): (Vec<Arc<ConfigEvent>>, bool) = {
         let guard = replay_buf.lock().expect("replay buffer poisoned");
         match guard.iter().position(|e| e.resource_version == resume_rv) {
             Some(idx) => {
-                let slice: Vec<ConfigEvent> = guard
+                let slice: Vec<Arc<ConfigEvent>> = guard
                     .iter()
                     .skip(idx + 1)
-                    .map(|e| e.event.clone())
+                    .map(|e| Arc::clone(&e.event))
                     .collect();
                 debug!(
                     namespace = %namespace,
@@ -305,13 +308,13 @@ async fn resume_from_buffer(
             .max()
             .unwrap_or(0);
 
-        // Collect under the lock, then release before any await.
-        let post_snapshot_events: Vec<ConfigEvent> = {
+        // Collect Arc clones under the lock, then release before any await.
+        let post_snapshot_events: Vec<Arc<ConfigEvent>> = {
             let guard = replay_buf.lock().expect("replay buffer poisoned");
             guard
                 .iter()
                 .filter(|e| e.resource_version.parse::<u64>().unwrap_or(0) > max_snapshot_rv)
-                .map(|e| e.event.clone())
+                .map(|e| Arc::clone(&e.event))
                 .collect()
         }; // mutex released here
 
@@ -322,14 +325,17 @@ async fn resume_from_buffer(
         );
 
         for event in post_snapshot_events {
-            if tx.send(Ok(event)).await.is_err() {
+            // Deref Arc to clone the ConfigEvent for the mpsc send.
+            if tx.send(Ok((*event).clone())).await.is_err() {
                 return; // subscriber disconnected
             }
         }
     } else {
         // Buffer hit — send only the missed events.
+        // Arc clones collected above are dereferenced here to produce ConfigEvent
+        // values for the per-subscriber mpsc — no extra serialisation.
         for event in replay_slice {
-            match tx.try_send(Ok(event)) {
+            match tx.try_send(Ok((*event).clone())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     warn!("Subscriber too slow during replay — disconnecting");
@@ -350,16 +356,21 @@ async fn resume_from_buffer(
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
 ///
+/// Receives `Arc<ConfigEvent>` from the broadcast — O(1) reference-count clone
+/// per receiver.  Dereferences the Arc to produce the `ConfigEvent` value sent
+/// over the per-subscriber mpsc channel (tonic's `ReceiverStream` takes owned
+/// values, not Arc).
+///
 /// Disconnects the subscriber with RESOURCE_EXHAUSTED if:
 /// - the mpsc channel is full (subscriber too slow to drain), or
 /// - the broadcast ring wrapped before this receiver drained (lagged).
 async fn bridge_broadcast(
-    mut bcast_rx: broadcast::Receiver<ConfigEvent>,
+    mut bcast_rx: broadcast::Receiver<Arc<ConfigEvent>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
 ) {
     loop {
         match bcast_rx.recv().await {
-            Ok(event) => match tx.try_send(Ok(event)) {
+            Ok(event) => match tx.try_send(Ok((*event).clone())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
@@ -407,7 +418,7 @@ mod tests {
     fn make_replay_buf(entries: &[(&str, u32)]) -> ReplayBuffer {
         let buf = Arc::new(Mutex::new(VecDeque::new()));
         for (rv, sv) in entries {
-            push_replay(&buf, rv.to_string(), make_event(rv, *sv));
+            push_replay(&buf, rv.to_string(), Arc::new(make_event(rv, *sv)));
         }
         buf
     }
@@ -457,7 +468,7 @@ mod tests {
             push_replay(
                 &buf,
                 format!("rv-{i}"),
-                make_event(&format!("rv-{i}"), i as u32),
+                Arc::new(make_event(&format!("rv-{i}"), i as u32)),
             );
         }
         // Buffer is exactly full — oldest is rv-0.
@@ -467,7 +478,11 @@ mod tests {
         );
 
         // Push one more — rv-0 must be evicted.
-        push_replay(&buf, "rv-overflow".into(), make_event("rv-overflow", 9999));
+        push_replay(
+            &buf,
+            "rv-overflow".into(),
+            Arc::new(make_event("rv-overflow", 9999)),
+        );
         let guard = buf.lock().unwrap();
         assert_eq!(guard.len(), REPLAY_BUFFER_SIZE);
         assert_eq!(guard.front().unwrap().resource_version, "rv-1");
@@ -488,7 +503,7 @@ mod tests {
             ("rv-5", 5),
         ]);
         let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         // Close the broadcast sender so bridge_broadcast exits cleanly after replay.
@@ -523,7 +538,7 @@ mod tests {
         let replay_buf = make_replay_buf(&[("rv-10", 10), ("rv-11", 11), ("rv-12", 12)]);
         // Cache has two entries.
         let cache = make_cache("default", &[("cfg-a", "rv-13", 13), ("cfg-b", "rv-14", 14)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         drop(bcast_tx); // let bridge_broadcast exit cleanly
@@ -564,7 +579,7 @@ mod tests {
         let cache = make_cache("default", &[("cfg", "rv-3", 3)]);
 
         // Pre-create a broadcast channel to simulate an already-running watcher.
-        let (bcast_tx, _initial_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (bcast_tx, _initial_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
 
         let mut handles = Vec::new();
         for _ in 0..10 {
@@ -608,14 +623,14 @@ mod tests {
     async fn resume_at_latest_rv_joins_live_broadcast() {
         let replay_buf = make_replay_buf(&[("rv-5", 5)]);
         let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         let bcast_tx_clone = bcast_tx.clone();
         tokio::spawn(async move {
             // Send one live event after a short delay.
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = bcast_tx_clone.send(make_event("rv-6", 6));
+            let _ = bcast_tx_clone.send(Arc::new(make_event("rv-6", 6)));
             drop(bcast_tx_clone);
         });
 
@@ -668,7 +683,7 @@ mod tests {
         // Cache reflects the state at the snapshot: only rv-5.
         let cache = make_cache("default", &[("cfg", "5", 5)]);
 
-        let (bcast_tx, bcast_rx) = broadcast::channel::<ConfigEvent>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
         let (tx, mut rx) = mpsc::channel(128);
 
         // Close the broadcast sender so bridge_broadcast exits cleanly after
@@ -697,6 +712,54 @@ mod tests {
             received_schema_versions,
             vec![5, 6, 7, 8],
             "miss-path must include snapshot + post-snapshot buffer events to close race window"
+        );
+    }
+
+    // ── Async: broadcast_arc_not_cloned — all receivers share one allocation ──
+    //
+    // Spawn 10 receiver tasks on a `broadcast::channel::<Arc<ConfigEvent>>`,
+    // send 1 event, verify all 10 receivers get a pointer to the SAME allocation.
+    // This confirms that the broadcast distributes reference-count increments
+    // only — no deep copy of the proto struct per subscriber.
+
+    #[tokio::test]
+    async fn broadcast_arc_not_cloned() {
+        let (bcast_tx, _) = broadcast::channel::<Arc<ConfigEvent>>(64);
+
+        const N: usize = 10;
+        let mut handles: Vec<tokio::task::JoinHandle<Arc<ConfigEvent>>> = Vec::with_capacity(N);
+
+        for _ in 0..N {
+            let mut rx = bcast_tx.subscribe();
+            let h = tokio::spawn(async move { rx.recv().await.expect("must receive event") });
+            handles.push(h);
+        }
+
+        let event = Arc::new(make_event("rv-1", 1));
+        // Record the pointer before sending (numeric address of the heap allocation).
+        let expected_ptr = Arc::as_ptr(&event) as usize;
+
+        bcast_tx.send(event).expect("send failed");
+
+        let mut received_arcs = Vec::with_capacity(N);
+        for h in handles {
+            let arc = h.await.expect("task panicked");
+            received_arcs.push(arc);
+        }
+
+        // All receivers must hold a reference to the SAME allocation — the
+        // broadcast clones only the Arc (refcount bump), not the ConfigEvent.
+        for arc in &received_arcs {
+            assert!(
+                Arc::ptr_eq(received_arcs.first().unwrap(), arc),
+                "all receivers must point to the same Arc allocation"
+            );
+        }
+        // Also verify the pointer matches what was sent.
+        assert_eq!(
+            Arc::as_ptr(received_arcs.first().unwrap()) as usize,
+            expected_ptr,
+            "received Arc must be the same allocation as the one sent"
         );
     }
 }
