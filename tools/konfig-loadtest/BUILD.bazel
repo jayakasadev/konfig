@@ -7,12 +7,12 @@ rust_binary(
     visibility = ["//docker/konfig-loadtest:__pkg__"],
     deps = [
         "//rust/konfig",
-        "@crates//:clap",
-        "@crates//:futures-util",
-        "@crates//:tokio",
-        "@crates//:tonic",
-        "@crates//:tracing",
-        "@crates//:tracing-subscriber",
+        "@konfig_crates//:clap",
+        "@konfig_crates//:futures-util",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tonic",
+        "@konfig_crates//:tracing",
+        "@konfig_crates//:tracing-subscriber",
     ],
 )
 
