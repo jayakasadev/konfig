@@ -41,7 +41,9 @@ impl ConfigCache {
     ///
     /// Returns `None` when no entry has been inserted for this key yet.
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
-        self.inner.get(&(namespace.to_string(), name.to_string())).map(|v| Arc::clone(&v))
+        self.inner
+            .get(&(namespace.to_string(), name.to_string()))
+            .map(|v| Arc::clone(&v))
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
@@ -52,7 +54,8 @@ impl ConfigCache {
 
     /// Remove the entry for `(namespace, name)` if present.
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.inner.remove(&(namespace.to_string(), name.to_string()));
+        self.inner
+            .remove(&(namespace.to_string(), name.to_string()));
     }
 
     /// Return all snapshots whose namespace matches `namespace`.
@@ -98,7 +101,8 @@ impl ConfigCache {
     /// watcher path.  Returns a default (empty) snapshot when the cache
     /// is unpopulated.
     pub fn load(&self) -> Arc<ConfigSnapshot> {
-        self.load_any().unwrap_or_else(|| Arc::new(ConfigSnapshot::default()))
+        self.load_any()
+            .unwrap_or_else(|| Arc::new(ConfigSnapshot::default()))
     }
 }
 

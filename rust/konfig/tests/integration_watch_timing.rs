@@ -44,9 +44,15 @@ async fn watch_stream_update_propagates_within_500ms() {
 
     // ── CREATE event ──────────────────────────────────────────────────────────
     let t0 = Instant::now();
-    upsert_config(&client, NAMESPACE, CFG_TIMING, 10, json!({"step": "create"}))
-        .await
-        .expect("create Config v10");
+    upsert_config(
+        &client,
+        NAMESPACE,
+        CFG_TIMING,
+        10,
+        json!({"step": "create"}),
+    )
+    .await
+    .expect("create Config v10");
 
     let cache_ref = Arc::clone(&cache);
     timeout(Duration::from_secs(5), async move {
@@ -66,9 +72,15 @@ async fn watch_stream_update_propagates_within_500ms() {
 
     // ── MODIFIED event ────────────────────────────────────────────────────────
     let t1 = Instant::now();
-    upsert_config(&client, NAMESPACE, CFG_TIMING, 11, json!({"step": "modify"}))
-        .await
-        .expect("update Config v11");
+    upsert_config(
+        &client,
+        NAMESPACE,
+        CFG_TIMING,
+        11,
+        json!({"step": "modify"}),
+    )
+    .await
+    .expect("update Config v11");
 
     let cache_ref2 = Arc::clone(&cache);
     timeout(Duration::from_secs(5), async move {

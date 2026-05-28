@@ -25,7 +25,10 @@ pub async fn handle_get(
                 name = %req.name,
                 "Get: config not found in cache",
             );
-            Err(Status::not_found(format!("config {}/{} not found", req.namespace, req.name)))
+            Err(Status::not_found(format!(
+                "config {}/{} not found",
+                req.namespace, req.name
+            )))
         }
     }
 }
@@ -74,7 +77,10 @@ mod tests {
     #[tokio::test]
     async fn get_returns_config_when_cache_populated() {
         let cache = make_cache("default", "my-config", 3);
-        let req = GetRequest { namespace: "default".into(), name: "my-config".into() };
+        let req = GetRequest {
+            namespace: "default".into(),
+            name: "my-config".into(),
+        };
         let resp = handle_get(cache, req).await.expect("must succeed");
         let cfg = resp.into_inner();
         assert_eq!(cfg.schema_version, 3);
@@ -85,7 +91,10 @@ mod tests {
     #[tokio::test]
     async fn get_returns_not_found_when_cache_empty() {
         let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
-        let req = GetRequest { namespace: "default".into(), name: "my-config".into() };
+        let req = GetRequest {
+            namespace: "default".into(),
+            name: "my-config".into(),
+        };
         let result = handle_get(cache, req).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -94,7 +103,10 @@ mod tests {
     #[tokio::test]
     async fn get_returns_not_found_for_wrong_key() {
         let cache = make_cache("default", "my-config", 3);
-        let req = GetRequest { namespace: "default".into(), name: "other-config".into() };
+        let req = GetRequest {
+            namespace: "default".into(),
+            name: "other-config".into(),
+        };
         let result = handle_get(cache, req).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -121,7 +133,9 @@ mod tests {
             ..Default::default()
         });
 
-        let req = GetAllRequest { namespace: "default".into() };
+        let req = GetAllRequest {
+            namespace: "default".into(),
+        };
         let resp = handle_get_all(cache, req).await.expect("must succeed");
         let mut stream = resp.into_inner();
         let mut count = 0usize;
@@ -136,7 +150,9 @@ mod tests {
     async fn get_all_empty_when_cache_unpopulated() {
         use tokio_stream::StreamExt;
         let cache = Arc::new(ConfigCache::new(ConfigSnapshot::default()));
-        let req = GetAllRequest { namespace: "default".into() };
+        let req = GetAllRequest {
+            namespace: "default".into(),
+        };
         let resp = handle_get_all(cache, req).await.expect("must succeed");
         let mut stream = resp.into_inner();
         assert!(stream.next().await.is_none());

@@ -76,7 +76,10 @@ async fn partition_apply_returns_unavailable_and_cache_returns_last_good() {
 
     let snap = cache.get(NAMESPACE, "cp-partition-cfg").unwrap();
     assert_eq!(snap.schema_version, 3, "last-known-good must be retained");
-    assert!(snap.stale_since.is_some(), "stale_since must be set after mark_all_stale");
+    assert!(
+        snap.stale_since.is_some(),
+        "stale_since must be set after mark_all_stale"
+    );
 }
 
 // ── Test 2: resourceVersion resume — no missed events ────────────────────────
@@ -114,18 +117,29 @@ async fn resource_version_resume_no_missed_events() {
             names: vec![],
             resume_resource_version: String::new(),
         };
-        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), Arc::new(dashmap::DashMap::new()), req)
-            .await
-            .expect("Subscribe must succeed");
+        let resp = handle_subscribe(
+            Arc::clone(&cache),
+            client.clone(),
+            Arc::new(dashmap::DashMap::new()),
+            req,
+        )
+        .await
+        .expect("Subscribe must succeed");
 
         let mut stream = resp.into_inner();
         let cache_client = client.clone();
 
         tokio::spawn(async move {
             for i in 0..5u32 {
-                upsert_config(&cache_client, NAMESPACE, &format!("rv-resume-{i}"), i + 1, json!({"i": i}))
-                    .await
-                    .expect("upsert");
+                upsert_config(
+                    &cache_client,
+                    NAMESPACE,
+                    &format!("rv-resume-{i}"),
+                    i + 1,
+                    json!({"i": i}),
+                )
+                .await
+                .expect("upsert");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
@@ -163,18 +177,29 @@ async fn resource_version_resume_no_missed_events() {
             names: vec![],
             resume_resource_version: last_rv,
         };
-        let resp = handle_subscribe(Arc::clone(&cache), client.clone(), Arc::new(dashmap::DashMap::new()), req)
-            .await
-            .expect("Subscribe (resume) must succeed");
+        let resp = handle_subscribe(
+            Arc::clone(&cache),
+            client.clone(),
+            Arc::new(dashmap::DashMap::new()),
+            req,
+        )
+        .await
+        .expect("Subscribe (resume) must succeed");
 
         let mut stream = resp.into_inner();
         let cache_client = client.clone();
 
         tokio::spawn(async move {
             for i in 5..10u32 {
-                upsert_config(&cache_client, NAMESPACE, &format!("rv-resume-{i}"), i + 1, json!({"i": i}))
-                    .await
-                    .expect("upsert");
+                upsert_config(
+                    &cache_client,
+                    NAMESPACE,
+                    &format!("rv-resume-{i}"),
+                    i + 1,
+                    json!({"i": i}),
+                )
+                .await
+                .expect("upsert");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
@@ -213,9 +238,15 @@ async fn concurrent_apply_409_retry_wins() {
     maybe_delete(&client, NAMESPACE, "cp-conflict-cfg").await;
 
     // Create initial version so the CRD exists before concurrent updates.
-    upsert_config(&client, NAMESPACE, "cp-conflict-cfg", 1, json!({"init": true}))
-        .await
-        .expect("initial upsert");
+    upsert_config(
+        &client,
+        NAMESPACE,
+        "cp-conflict-cfg",
+        1,
+        json!({"init": true}),
+    )
+    .await
+    .expect("initial upsert");
 
     // Two concurrent Apply calls: v=2 and v=3.  Both should succeed.
     let (r2, r3) = tokio::join!(
@@ -257,19 +288,33 @@ async fn schema_version_monotonicity_enforced() {
     maybe_delete(&client, NAMESPACE, "cp-mono-cfg").await;
 
     // v=1: first apply — must succeed.
-    apply_inner(NAMESPACE, "cp-mono-cfg", "schema_version: 1\ncontent: {}", client.clone())
-        .await
-        .expect("v=1 must succeed");
+    apply_inner(
+        NAMESPACE,
+        "cp-mono-cfg",
+        "schema_version: 1\ncontent: {}",
+        client.clone(),
+    )
+    .await
+    .expect("v=1 must succeed");
 
     // v=2: must succeed.
-    apply_inner(NAMESPACE, "cp-mono-cfg", "schema_version: 2\ncontent: {}", client.clone())
-        .await
-        .expect("v=2 must succeed");
+    apply_inner(
+        NAMESPACE,
+        "cp-mono-cfg",
+        "schema_version: 2\ncontent: {}",
+        client.clone(),
+    )
+    .await
+    .expect("v=2 must succeed");
 
     // v=1: downgrade — must fail FAILED_PRECONDITION.
-    let r1 =
-        apply_inner(NAMESPACE, "cp-mono-cfg", "schema_version: 1\ncontent: {}", client.clone())
-            .await;
+    let r1 = apply_inner(
+        NAMESPACE,
+        "cp-mono-cfg",
+        "schema_version: 1\ncontent: {}",
+        client.clone(),
+    )
+    .await;
     assert!(r1.is_err());
     assert_eq!(
         r1.unwrap_err().code(),
@@ -278,9 +323,13 @@ async fn schema_version_monotonicity_enforced() {
     );
 
     // v=2: same version — must fail FAILED_PRECONDITION.
-    let r2 =
-        apply_inner(NAMESPACE, "cp-mono-cfg", "schema_version: 2\ncontent: {}", client.clone())
-            .await;
+    let r2 = apply_inner(
+        NAMESPACE,
+        "cp-mono-cfg",
+        "schema_version: 2\ncontent: {}",
+        client.clone(),
+    )
+    .await;
     assert!(r2.is_err());
     assert_eq!(
         r2.unwrap_err().code(),
@@ -289,9 +338,14 @@ async fn schema_version_monotonicity_enforced() {
     );
 
     // v=3: upgrade — must succeed.
-    apply_inner(NAMESPACE, "cp-mono-cfg", "schema_version: 3\ncontent: {}", client.clone())
-        .await
-        .expect("v=3 upgrade must succeed");
+    apply_inner(
+        NAMESPACE,
+        "cp-mono-cfg",
+        "schema_version: 3\ncontent: {}",
+        client.clone(),
+    )
+    .await
+    .expect("v=3 upgrade must succeed");
 }
 
 // ── Test 5: BOOKMARK handling — cursor advances, no spurious events ───────────
@@ -326,8 +380,14 @@ async fn bookmark_events_not_emitted_to_subscribers() {
         names: vec![],
         resume_resource_version: String::new(),
     };
-    let resp =
-        handle_subscribe(cache, client.clone(), Arc::new(dashmap::DashMap::new()), req).await.expect("Subscribe must succeed");
+    let resp = handle_subscribe(
+        cache,
+        client.clone(),
+        Arc::new(dashmap::DashMap::new()),
+        req,
+    )
+    .await
+    .expect("Subscribe must succeed");
     let mut stream = resp.into_inner();
 
     let apply_client = client.clone();
@@ -359,5 +419,8 @@ async fn bookmark_events_not_emitted_to_subscribers() {
         }
     }
 
-    assert_eq!(count, 20, "expected exactly 20 ConfigEvents — no bookmark events leaked");
+    assert_eq!(
+        count, 20,
+        "expected exactly 20 ConfigEvents — no bookmark events leaked"
+    );
 }

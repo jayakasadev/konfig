@@ -43,8 +43,11 @@ pub async fn handle_get_all_secrets(
 }
 
 pub fn secret_snapshot_to_proto(snap: &SecretSnapshot) -> SecretResponse {
-    let data_map: std::collections::HashMap<&str, &str> =
-        snap.data.iter().map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap_or(""))).collect();
+    let data_map: std::collections::HashMap<&str, &str> = snap
+        .data
+        .iter()
+        .map(|(k, v)| (k.as_str(), std::str::from_utf8(v).unwrap_or("")))
+        .collect();
     SecretResponse {
         namespace: snap.namespace.clone(),
         name: snap.name.clone(),
@@ -71,7 +74,9 @@ mod tests {
             namespace: namespace.to_string(),
             name: name.to_string(),
             schema_version,
-            data: [("key1".to_string(), Bytes::from("dmFsdWUx".to_string()))].into_iter().collect(),
+            data: [("key1".to_string(), Bytes::from("dmFsdWUx".to_string()))]
+                .into_iter()
+                .collect(),
             resource_version: "rv-001".to_string(),
             loaded_at: std::time::Instant::now(),
         });
@@ -81,7 +86,10 @@ mod tests {
     #[tokio::test]
     async fn get_secret_returns_response_when_found() {
         let cache = make_cache_with_secret("trading", "api-keys", 3);
-        let req = GetSecretRequest { namespace: "trading".into(), name: "api-keys".into() };
+        let req = GetSecretRequest {
+            namespace: "trading".into(),
+            name: "api-keys".into(),
+        };
         let resp = handle_get_secret(cache, req).await.expect("must succeed");
         let sr = resp.into_inner();
         assert_eq!(sr.namespace, "trading");
@@ -93,7 +101,10 @@ mod tests {
     #[tokio::test]
     async fn get_secret_returns_not_found_for_missing_key() {
         let cache = Arc::new(SecretCache::new());
-        let req = GetSecretRequest { namespace: "trading".into(), name: "nonexistent".into() };
+        let req = GetSecretRequest {
+            namespace: "trading".into(),
+            name: "nonexistent".into(),
+        };
         let result = handle_get_secret(cache, req).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -115,8 +126,12 @@ mod tests {
             ..Default::default()
         });
 
-        let req = GetAllSecretsRequest { namespace: "ns".into() };
-        let resp = handle_get_all_secrets(cache, req).await.expect("must succeed");
+        let req = GetAllSecretsRequest {
+            namespace: "ns".into(),
+        };
+        let resp = handle_get_all_secrets(cache, req)
+            .await
+            .expect("must succeed");
         let mut stream = resp.into_inner();
         let mut count = 0usize;
         while let Some(item) = stream.next().await {
