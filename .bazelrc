@@ -11,7 +11,11 @@ build --@rules_rust//:extra_rustc_flags=-Cforce-frame-pointers=yes
 # CI profile — disable disk cache path expansion for remote runners.
 build:ci --disk_cache=
 
-# Release profile — optimised binaries.
+# Release profile — optimised binaries with native CPU tuning.
 build:release -c opt
 build:release --@rules_rust//:extra_rustc_flags=-Cpanic=abort
 build:release --@rules_rust//:extra_rustc_flags=-Cstrip=symbols
+build:release --@rules_rust//:extra_rustc_flags=-Ctarget-cpu=native
+
+# Linux arm64 target — used when building container images on Apple Silicon.
+build:linux-arm64 --platforms=//platforms:linux_arm64

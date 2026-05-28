@@ -1,18 +1,51 @@
-# Multistage Docker build: rust:1.88-slim compiles, distroless/cc-debian12:nonroot packages.
-#
-# Usage:
-#   bazel run //docker/konfig:push                 # build + push linux/arm64 (Docker Desktop default)
-#   bazel run //docker/konfig:push -- linux/amd64  # build + push linux/amd64 (EKS)
-#   bazel run //docker/konfig:load                 # build + load into local Docker daemon
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_pkg//pkg:mappings.bzl", "pkg_files", "strip_prefix")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 
-sh_binary(
-    name = "push",
-    srcs = ["push.sh"],
-    data = ["Dockerfile"],
+# Rename konfig_bin → konfig for the container entrypoint.
+pkg_files(
+    name = "konfig_files",
+    srcs = ["//rust/konfig:konfig_bin"],
+    prefix = "/",
+    renames = {"//rust/konfig:konfig_bin": "konfig"},
+    strip_prefix = strip_prefix.from_root(),
 )
 
-sh_binary(
+# Single layer containing the renamed binary.
+pkg_tar(
+    name = "layer",
+    srcs = [":konfig_files"],
+)
+
+# OCI image: distroless base + binary layer.
+# Build with: bazel run //docker/konfig:load --config=release --config=linux-arm64
+oci_image(
+    name = "image",
+    base = "@distroless_cc",
+    tars = [":layer"],
+    entrypoint = ["/konfig"],
+    exposed_ports = [
+        "50051/tcp",
+        "9090/tcp",
+    ],
+)
+
+# Load into local Docker daemon (docker-desktop).
+# bazel run //docker/konfig:load --config=release --config=linux-arm64
+oci_load(
     name = "load",
-    srcs = ["load.sh"],
-    data = ["Dockerfile"],
+    image = ":image",
+    repo_tags = [
+        "kasa288/konfig:main",
+        "kasa288/konfig:latest",
+    ],
+)
+
+# Push to registry.
+# bazel run //docker/konfig:push --config=release --config=linux-arm64
+oci_push(
+    name = "push",
+    image = ":image",
+    remote_tags = ["main"],
+    repository = "kasa288/konfig",
 )
