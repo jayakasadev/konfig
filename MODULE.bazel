@@ -24,30 +24,37 @@ module(
 )
 
 ##################################
-# Core rules
+# Core rules — always required
 ##################################
 bazel_dep(name = "rules_rust", version = "")
 bazel_dep(name = "platforms", version = "0.0.11")
 bazel_dep(name = "bazel_skylib", version = "1.8.1")
 bazel_dep(name = "aspect_bazel_lib", version = "2.14.0")
 
-archive_override(
-    module_name = "rules_rust",
-    integrity = "sha256-M0pWfqFlvnFwxMqJ2t56Yu7HveOtEZhup5qxHQTh2ig=",
-    strip_prefix = "rules_rust-19beae81b7b97b2bf4135f9f2f1a6f63477adde2",
-    urls = ["https://github.com/bazelbuild/rules_rust/archive/19beae81b7b97b2bf4135f9f2f1a6f63477adde2.tar.gz"],
-)
+# NOTE: archive_override is root-module-only.
+# When konfig is used as a dep, the root workspace provides this override.
+# For standalone development, add to your .bazelrc or MODULE.bazel:
+#   archive_override(
+#       module_name = "rules_rust",
+#       integrity = "sha256-M0pWfqFlvnFwxMqJ2t56Yu7HveOtEZhup5qxHQTh2ig=",
+#       strip_prefix = "rules_rust-19beae81b7b97b2bf4135f9f2f1a6f63477adde2",
+#       urls = ["https://github.com/bazelbuild/rules_rust/archive/19beae81b7b97b2bf4135f9f2f1a6f63477adde2.tar.gz"],
+#   )
 
 ##################################
-# Rust toolchain
+# Rust toolchain (dev only — root workspace provides when used as dep)
 ##################################
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust = use_extension(
+    "@rules_rust//rust:extensions.bzl",
+    "rust",
+    dev_dependency = True,
+)
 rust.toolchain(
     edition = "2024",
     versions = ["1.95.0"],
 )
 use_repo(rust, "rust_toolchains")
-register_toolchains("@rust_toolchains//:all")
+register_toolchains("@rust_toolchains//:all", dev_dependency = True)
 
 ##################################
 # Protobuf
@@ -58,12 +65,16 @@ bazel_dep(name = "rules_rust_prost", version = "0.69.0")
 bazel_dep(name = "rules_rust_protobuf", version = "0.69.0")
 
 ##################################
-# OCI images
+# OCI images (dev only — used for building/pushing the server image)
 ##################################
 bazel_dep(name = "rules_oci", version = "2.3.0")
 bazel_dep(name = "rules_pkg", version = "1.2.0")
 
-oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci = use_extension(
+    "@rules_oci//oci:extensions.bzl",
+    "oci",
+    dev_dependency = True,
+)
 oci.pull(
     name = "distroless_cc",
     image = "gcr.io/distroless/cc-debian13",
@@ -73,26 +84,26 @@ oci.pull(
     ],
     tag = "nonroot",
 )
-use_repo(oci,
+use_repo(
+    oci,
     "distroless_cc",
     "distroless_cc_linux_amd64",
     "distroless_cc_linux_arm64_v8",
+    dev_dependency = True,
 )
 
 ##################################
-# LLVM cross-compilation toolchain
+# LLVM cross-compilation toolchain (dev only)
 ##################################
 bazel_dep(name = "toolchains_llvm", version = "1.7.0")
 
-archive_override(
-    module_name = "toolchains_llvm",
-    integrity = "sha256-rnk2El123pJdGmd3czxchUP2DOVe7caJtfeTqzKhgkM=",
-    strip_prefix = "toolchains_llvm-3aad06c2d166cd89a09236694ecd9bf0f1c1b37d",
-    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/3aad06c2d166cd89a09236694ecd9bf0f1c1b37d.tar.gz"],
+llvm = use_extension(
+    "@toolchains_llvm//toolchain/extensions:llvm.bzl",
+    "llvm",
+    dev_dependency = True,
 )
-
-llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
 llvm.toolchain(
+    name = "konfig_llvm_toolchain",
     cxx_standard = {"": "c++23"},
     llvm_versions = {
         "": "21.1.8",
@@ -103,11 +114,12 @@ llvm.toolchain(
         "x86_64-unknown-linux-gnu": "libc++",
     },
 )
-use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
-register_toolchains("@llvm_toolchain//:all")
+use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm", dev_dependency = True)
+register_toolchains("@konfig_llvm_toolchain//:all", dev_dependency = True)
 
 ##################################
-# Crate universe — all konfig Rust deps
+# Crate universe — konfig's Rust deps
+# NOT dev_dependency: needed to build @konfig//rust/konfig:konfig targets
 ##################################
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(

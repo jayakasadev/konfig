@@ -12,7 +12,11 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,17 +25,16 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
 
-      # Bazel disk cache — keyed on MODULE.bazel.lock + Cargo.lock so cache
-      # stays valid across commits that don't change deps.
-      - name: Restore Bazel disk cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/bazel-disk-cache
-          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock') }}
-          restore-keys: bazel-${{ runner.os }}-
-
-      - name: Configure disk cache path
-        run: echo "build --disk_cache=$HOME/.cache/bazel-disk-cache" >> .bazelrc.user
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
 
       - name: Build
         run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli
@@ -44,8 +47,10 @@ jobs:
 
   integration-tests:
     name: Integration tests (K3s)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-integration')
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +59,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
 
-      - name: Restore Cargo cache
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
