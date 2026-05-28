@@ -19,7 +19,7 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::api::{WatchEvent, WatchParams};
 use kube::{Api, Client};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
@@ -40,6 +40,7 @@ const BROADCAST_CAPACITY: usize = 1_024;
 pub async fn handle_subscribe_secrets(
     kube_client: Client,
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+    drain_notify: Arc<Notify>,
     req: SubscribeSecretsRequest,
 ) -> Result<Response<ReceiverStream<Result<SecretEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "SubscribeSecrets RPC");
@@ -50,7 +51,13 @@ pub async fn handle_subscribe_secrets(
 
     if !resume_rv.is_empty() {
         // Resume path: per-subscriber raw watch (broadcast can't share resume points).
-        tokio::spawn(run_raw_watch(kube_client, namespace, resume_rv, tx));
+        tokio::spawn(run_raw_watch(
+            kube_client,
+            namespace,
+            resume_rv,
+            tx,
+            drain_notify,
+        ));
         return Ok(Response::new(ReceiverStream::new(rx)));
     }
 
@@ -62,7 +69,7 @@ pub async fn handle_subscribe_secrets(
     })?;
 
     // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
-    tokio::spawn(bridge_broadcast(bcast_rx, tx));
+    tokio::spawn(bridge_broadcast(bcast_rx, tx, drain_notify));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
@@ -83,40 +90,54 @@ fn get_broadcast_rx(
 /// Disconnects the subscriber with RESOURCE_EXHAUSTED if:
 /// - the mpsc channel is full (subscriber too slow to drain), or
 /// - the broadcast ring wrapped before this receiver drained (lagged).
+///
+/// Closes the stream cleanly (drops the mpsc sender) on `drain_notify` —
+/// the SIGTERM-graceful-shutdown path.
 async fn bridge_broadcast(
     mut bcast_rx: broadcast::Receiver<SecretEvent>,
     tx: mpsc::Sender<Result<SecretEvent, Status>>,
+    drain_notify: Arc<Notify>,
 ) {
     loop {
-        match bcast_rx.recv().await {
-            Ok(event) => match tx.try_send(Ok(event)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    warn!("Secret subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
-                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                    break;
-                }
-                Err(TrySendError::Closed(_)) => {
-                    info!("Secret subscriber disconnected");
-                    break;
-                }
-            },
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(missed = n, "Secret subscriber lagged — disconnecting");
-                let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
-                break;
+        tokio::select! {
+            _ = drain_notify.notified() => {
+                info!("Secret subscriber: drain signalled — closing stream cleanly");
+                return;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
+            recv = bcast_rx.recv() => match recv {
+                Ok(event) => match tx.try_send(Ok(event)) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        warn!("Secret subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
+                        let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        info!("Secret subscriber disconnected");
+                        break;
+                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(missed = n, "Secret subscriber lagged — disconnecting");
+                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
 }
 
 /// Raw kube watch from a specific `resource_version` (resume path).
+///
+/// On `drain_notify`, the loop exits and drops `tx` so the subscriber sees
+/// end-of-stream cleanly during graceful shutdown.
 async fn run_raw_watch(
     kube_client: Client,
     namespace: String,
     resource_version: String,
     tx: mpsc::Sender<Result<SecretEvent, Status>>,
+    drain_notify: Arc<Notify>,
 ) {
     let api: Api<Secret> = Api::namespaced(kube_client, &namespace);
     let wp = WatchParams::default()
@@ -134,41 +155,50 @@ async fn run_raw_watch(
 
     let mut stream = stream.boxed();
 
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(WatchEvent::Added(secret)) | Ok(WatchEvent::Modified(secret)) => {
-                let ns = secret
-                    .metadata
-                    .namespace
-                    .as_deref()
-                    .unwrap_or(&namespace)
-                    .to_string();
-                if !emit_to_mpsc(&tx, EventType::Modified as i32, &secret, &ns).await {
-                    break;
+    loop {
+        tokio::select! {
+            _ = drain_notify.notified() => {
+                info!("SubscribeSecrets raw watch: drain signalled — closing cleanly");
+                return;
+            }
+            next = stream.next() => {
+                let Some(result) = next else { break };
+                match result {
+                    Ok(WatchEvent::Added(secret)) | Ok(WatchEvent::Modified(secret)) => {
+                        let ns = secret
+                            .metadata
+                            .namespace
+                            .as_deref()
+                            .unwrap_or(&namespace)
+                            .to_string();
+                        if !emit_to_mpsc(&tx, EventType::Modified as i32, &secret, &ns).await {
+                            break;
+                        }
+                    }
+                    Ok(WatchEvent::Deleted(secret)) => {
+                        let ns = secret
+                            .metadata
+                            .namespace
+                            .as_deref()
+                            .unwrap_or(&namespace)
+                            .to_string();
+                        if !emit_to_mpsc(&tx, EventType::Deleted as i32, &secret, &ns).await {
+                            break;
+                        }
+                    }
+                    Ok(WatchEvent::Bookmark(_)) => {
+                        debug!("SubscribeSecrets: BOOKMARK received — cursor advanced");
+                    }
+                    Ok(WatchEvent::Error(e)) => {
+                        warn!("SubscribeSecrets raw watch error event: {e}");
+                        let _ = tx.try_send(Err(Status::internal(format!("watch error: {e}"))));
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("SubscribeSecrets raw watch stream error: {e}");
+                        break;
+                    }
                 }
-            }
-            Ok(WatchEvent::Deleted(secret)) => {
-                let ns = secret
-                    .metadata
-                    .namespace
-                    .as_deref()
-                    .unwrap_or(&namespace)
-                    .to_string();
-                if !emit_to_mpsc(&tx, EventType::Deleted as i32, &secret, &ns).await {
-                    break;
-                }
-            }
-            Ok(WatchEvent::Bookmark(_)) => {
-                debug!("SubscribeSecrets: BOOKMARK received — cursor advanced");
-            }
-            Ok(WatchEvent::Error(e)) => {
-                warn!("SubscribeSecrets raw watch error event: {e}");
-                let _ = tx.try_send(Err(Status::internal(format!("watch error: {e}"))));
-                break;
-            }
-            Err(e) => {
-                warn!("SubscribeSecrets raw watch stream error: {e}");
-                break;
             }
         }
     }
@@ -285,7 +315,7 @@ mod tests {
         let (bcast_tx, bcast_rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
         let (mpsc_tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx));
+        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx, Arc::new(Notify::new())));
 
         let event = make_secret_event("trading", "api-keys", EventType::Added as i32);
         bcast_tx.send(event.clone()).unwrap();
@@ -304,7 +334,7 @@ mod tests {
         let (bcast_tx, bcast_rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
         let (mpsc_tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
 
-        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx));
+        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx, Arc::new(Notify::new())));
 
         let event = make_secret_event("trading", "api-keys", EventType::Deleted as i32);
         bcast_tx.send(event).unwrap();
@@ -324,7 +354,7 @@ mod tests {
         for _ in 0..N {
             let bcast_rx = bcast_tx.subscribe();
             let (mpsc_tx, mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
-            tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx));
+            tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx, Arc::new(Notify::new())));
             streams.push(ReceiverStream::new(mpsc_rx));
         }
 
@@ -356,7 +386,7 @@ mod tests {
         let (bcast_tx, bcast_rx) = broadcast::channel::<SecretEvent>(1);
         let (mpsc_tx, mpsc_rx) = mpsc::channel::<Result<SecretEvent, Status>>(CHANNEL_CAPACITY);
 
-        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx));
+        tokio::spawn(bridge_broadcast(bcast_rx, mpsc_tx, Arc::new(Notify::new())));
 
         // Flood the ring: bcast_rx has not drained event 1 before event 2
         // overwrites it.  On the next recv(), bridge gets Lagged.
@@ -448,5 +478,31 @@ mod tests {
         // Must be base64, not plaintext.
         assert_ne!(s, "plaintext");
         assert_eq!(s, "cGxhaW50ZXh0");
+    }
+
+    /// Drain notification closes the secret bridge cleanly (drops mpsc sender).
+    #[tokio::test]
+    async fn drain_notify_closes_secret_bridge_cleanly() {
+        use std::time::Duration;
+        let (_bcast_tx, bcast_rx) = broadcast::channel::<SecretEvent>(BROADCAST_CAPACITY);
+        let (mpsc_tx, mut mpsc_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let drain_notify = Arc::new(Notify::new());
+
+        let drain_clone = Arc::clone(&drain_notify);
+        let bridge =
+            tokio::spawn(async move { bridge_broadcast(bcast_rx, mpsc_tx, drain_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge must exit within 1 s after drain")
+            .expect("task panicked");
+
+        assert!(
+            mpsc_rx.recv().await.is_none(),
+            "drain must close cleanly (no error frame)"
+        );
     }
 }

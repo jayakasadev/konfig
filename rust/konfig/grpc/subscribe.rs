@@ -25,7 +25,7 @@ use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
@@ -94,6 +94,7 @@ pub async fn handle_subscribe(
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
+    drain_notify: Arc<Notify>,
     req: SubscribeRequest,
 ) -> Result<Response<ReceiverStream<Result<ConfigEvent, Status>>>, Status> {
     debug!(namespace = %req.namespace, resume_rv = %req.resume_resource_version, "Subscribe RPC");
@@ -127,12 +128,13 @@ pub async fn handle_subscribe(
             namespace.clone(),
             bcast_rx,
             tx,
+            drain_notify,
         ));
         return Ok(Response::new(ReceiverStream::new(rx)));
     }
 
     // Fresh subscribe (no resume_resource_version) — join live broadcast directly.
-    tokio::spawn(bridge_broadcast(bcast_rx, tx, namespace));
+    tokio::spawn(bridge_broadcast(bcast_rx, tx, namespace, drain_notify));
 
     Ok(Response::new(ReceiverStream::new(rx)))
 }
@@ -358,6 +360,7 @@ async fn resume_from_buffer(
     namespace: String,
     bcast_rx: broadcast::Receiver<Arc<BroadcastFrame>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
+    drain_notify: Arc<Notify>,
 ) {
     // Collect the replay slice under the lock, then release before doing I/O.
     // Also record whether resume_rv was found in the buffer.
@@ -476,7 +479,7 @@ async fn resume_from_buffer(
     }
 
     // Join the live broadcast for future events.
-    bridge_broadcast(bcast_rx, tx, namespace).await;
+    bridge_broadcast(bcast_rx, tx, namespace, drain_notify).await;
 }
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
@@ -496,6 +499,11 @@ async fn resume_from_buffer(
 /// - the mpsc channel is full (subscriber too slow to drain), or
 /// - the broadcast ring wrapped before this receiver drained (lagged).
 ///
+/// Closes the stream cleanly (drops the mpsc sender so the client sees
+/// end-of-stream / `Ok(None)`) when `drain_notify` fires — used by SIGTERM
+/// shutdown to release reconnecting clients onto a healthy peer instead of
+/// killing them mid-stream when the listener goes away.
+///
 /// Increments `konfig_active_subscribers` on entry and decrements on every
 /// exit path via a `SubGauge` RAII guard.  Increments
 /// `konfig_broadcast_lag_total` when the broadcast ring wraps and
@@ -504,42 +512,52 @@ async fn bridge_broadcast(
     mut bcast_rx: broadcast::Receiver<Arc<BroadcastFrame>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
     namespace: String,
+    drain_notify: Arc<Notify>,
 ) {
     ACTIVE_SUBSCRIBERS.with_label_values(&[&namespace]).inc();
     // Decrement on every exit path — including early returns from break.
     let _guard = SubGauge(namespace.clone());
 
     loop {
-        match bcast_rx.recv().await {
-            Ok(frame) => {
-                // Observe end-to-end latency BEFORE forwarding — measures the
-                // broadcast send→receive path only.  `sent_at.elapsed()` is a
-                // monotonic delta; it cannot go negative even under wall-clock
-                // jumps.
-                SUBSCRIBE_E2E_LATENCY
-                    .with_label_values(&[&namespace])
-                    .observe(frame.sent_at.elapsed().as_secs_f64());
+        tokio::select! {
+            // Drain signal — close the stream cleanly so the client reconnects
+            // to a healthy pod.  We drop `tx` by returning, which surfaces as
+            // `Ok(None)` (end-of-stream) on the client.
+            _ = drain_notify.notified() => {
+                info!(namespace = %namespace, "Subscriber: drain signalled — closing stream cleanly");
+                return;
+            }
+            recv = bcast_rx.recv() => match recv {
+                Ok(frame) => {
+                    // Observe end-to-end latency BEFORE forwarding — measures the
+                    // broadcast send→receive path only.  `sent_at.elapsed()` is a
+                    // monotonic delta; it cannot go negative even under wall-clock
+                    // jumps.
+                    SUBSCRIBE_E2E_LATENCY
+                        .with_label_values(&[&namespace])
+                        .observe(frame.sent_at.elapsed().as_secs_f64());
 
-                match tx.try_send(Ok((*frame.event).clone())) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
-                        let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                        break;
+                    match tx.try_send(Ok((*frame.event).clone())) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
+                            let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                            break;
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            info!("Subscriber disconnected");
+                            break;
+                        }
                     }
-                    Err(TrySendError::Closed(_)) => {
-                        info!("Subscriber disconnected");
-                        break;
-                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(missed = n, "Subscriber lagged — disconnecting");
+                    BROADCAST_LAG.with_label_values(&[&namespace]).inc();
+                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
+                    break;
                 }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(missed = n, "Subscriber lagged — disconnecting");
-                BROADCAST_LAG.with_label_values(&[&namespace]).inc();
-                let _ = tx.try_send(Err(Status::resource_exhausted("subscriber lagged")));
-                break;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -677,6 +695,7 @@ mod tests {
             "default".into(),
             bcast_rx,
             tx,
+            Arc::new(Notify::new()),
         ));
 
         let mut received_schema_versions: Vec<u32> = Vec::new();
@@ -711,6 +730,7 @@ mod tests {
             "default".into(),
             bcast_rx,
             tx,
+            Arc::new(Notify::new()),
         ));
 
         let mut received: Vec<u32> = Vec::new();
@@ -759,6 +779,7 @@ mod tests {
                     "default".into(),
                     bcast_rx,
                     tx,
+                    Arc::new(Notify::new()),
                 )
                 .await;
                 while rx.recv().await.is_some() {}
@@ -802,6 +823,7 @@ mod tests {
             "default".into(),
             bcast_rx,
             tx,
+            Arc::new(Notify::new()),
         ));
 
         // Drop the original sender too so bridge exits after the live event.
@@ -858,6 +880,7 @@ mod tests {
             "default".into(),
             bcast_rx,
             tx,
+            Arc::new(Notify::new()),
         ));
 
         let mut received_schema_versions: Vec<u32> = Vec::new();
@@ -1052,7 +1075,12 @@ mod tests {
             .get_sample_count();
 
         // Spawn bridge.
-        let bridge = tokio::spawn(bridge_broadcast(bcast_rx, tx, ns.to_string()));
+        let bridge = tokio::spawn(bridge_broadcast(
+            bcast_rx,
+            tx,
+            ns.to_string(),
+            Arc::new(Notify::new()),
+        ));
 
         // Broadcast 5 frames with the send timestamp slightly in the past so
         // each `sent_at.elapsed()` is strictly positive.
@@ -1089,5 +1117,41 @@ mod tests {
             sum > 0.0,
             "observed latency sum must be strictly positive (got {sum})"
         );
+    }
+
+    // ── Drain: bridge_broadcast closes cleanly when notified ─────────────────
+
+    /// When `drain_notify` fires, `bridge_broadcast` returns immediately and
+    /// drops the mpsc sender — the subscriber observes end-of-stream
+    /// (`Ok(None)`), not an error.  This is the SIGTERM-graceful-shutdown path:
+    /// existing streams must close cleanly so clients reconnect to a healthy
+    /// pod instead of treating the disconnect as a server crash.
+    #[tokio::test]
+    async fn drain_notify_closes_bridge_broadcast_cleanly() {
+        let (_bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain_notify = Arc::new(Notify::new());
+
+        let drain_clone = Arc::clone(&drain_notify);
+        let bridge = tokio::spawn(async move {
+            bridge_broadcast(bcast_rx, tx, "default".into(), drain_clone).await;
+        });
+
+        // Give the bridge a tick to park on the select.
+        tokio::task::yield_now().await;
+
+        // Fire the drain — bridge must exit cleanly within 1 s.
+        drain_notify.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge must exit within 1 s after drain")
+            .expect("task panicked");
+
+        // The client side sees end-of-stream (Ok(None)) — NOT an error frame.
+        match rx.recv().await {
+            None => {} // expected: clean close
+            Some(other) => panic!("expected clean close (None); got {other:?}"),
+        }
     }
 }
