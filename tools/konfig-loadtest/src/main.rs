@@ -1,10 +1,15 @@
 //! konfig-loadtest — 4-scenario gRPC stress test for Konfig.
 //!
+//! Profiling stack:
+//!   dial9-tokio-telemetry — nanosecond runtime traces → `dial9 serve --local-dir /tmp/dial9`
+//!   tokio-console          — live task inspector       → `tokio-console`
+//!   tracing                — structured spans/events
+//!
 //! Scenarios:
-//!   1. subscribe_flood  — 100 subscribers + 200 applies at 100 ms intervals
-//!   2. get_flood        — 50 concurrent tasks × 100 Get RPCs
+//!   1. subscribe_flood  — 100 subscribers + 200 applies at 100 ms intervals, p99 < 500ms
+//!   2. get_flood        — 50 concurrent tasks × 100 Get RPCs, p99 < 50ms
 //!   3. reconnect_storm  — 50 subscribers disconnected + resumed with RV
-//!   4. secrets_flood    — 20 ApplySecret + 50 SubscribeSecrets streams
+//!   4. secrets_flood    — 20 ApplySecret + 50 SubscribeSecrets streams, p99 < 500ms
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,7 +19,7 @@ use futures_util::StreamExt as _;
 use tokio::sync::{Barrier, Mutex};
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 use konfig::proto::konfig_service_client::KonfigServiceClient;
 use konfig::proto::{
@@ -30,13 +35,17 @@ struct Args {
     addr: String,
     #[arg(long, default_value = "default")]
     namespace: String,
-    #[arg(long, default_value = "app-config")]
+    #[arg(long, default_value = "my-config")]
     config_name: String,
-    #[arg(long, default_value = "app-secret")]
+    #[arg(long, default_value = "my-config-secret")]
     secret_name: String,
     /// Which scenario to run: all | subscribe | get | reconnect | secrets
     #[arg(long, default_value = "all")]
     scenario: String,
+}
+
+fn telemetry_config() -> dial9_tokio_telemetry::Dial9Config {
+    dial9_tokio_telemetry::Dial9Config::from_env()
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -123,15 +132,25 @@ async fn connect(addr: &str) -> Result<Channel, tonic::transport::Error> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main]
+#[dial9_tokio_telemetry::main(config = telemetry_config)]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("konfig_loadtest=info".parse()?)
-                .add_directive("konfig=info".parse()?),
+    let (console_layer, console_server) = console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .build();
+
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(dial9_tokio_telemetry::tracing_layer::Dial9TokioLayer::new())
+        .with(
+            tracing_subscriber::fmt::layer().with_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("konfig_loadtest=info".parse()?)
+                    .add_directive("konfig=info".parse()?),
+            ),
         )
         .init();
+
+    tokio::spawn(console_server.serve());
 
     let args = Args::parse();
 
