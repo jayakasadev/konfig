@@ -1690,6 +1690,7 @@ dependencies = [
  "futures-util",
  "k8s-openapi",
  "kube",
+ "lazy_static",
  "prometheus",
  "prost 0.14.3",
  "rustls",
