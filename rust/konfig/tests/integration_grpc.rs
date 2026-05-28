@@ -31,8 +31,9 @@ const CFG_GRPC_APPLY: &str = "integ-grpc-apply";
 // ── Shared server setup ───────────────────────────────────────────────────────
 
 async fn start_server(cache: Arc<ConfigCache>, kube_client: kube::Client) -> u16 {
-    let listener =
-        tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("failed to bind listener");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind listener");
     let addr = listener.local_addr().expect("no local addr");
     drop(listener);
 
@@ -74,7 +75,11 @@ async fn grpc_get_returns_config() {
     let watcher_client = client.clone();
     let watcher_handle = tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG_GRPC_GET.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG_GRPC_GET.to_string(),
+            )
             .await
             .expect("watcher error");
     });
@@ -97,7 +102,10 @@ async fn grpc_get_returns_config() {
     let mut grpc = connect(port).await;
 
     let resp = grpc
-        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: CFG_GRPC_GET.into() }))
+        .get(Request::new(GetRequest {
+            namespace: NAMESPACE.into(),
+            name: CFG_GRPC_GET.into(),
+        }))
         .await
         .expect("Get RPC failed");
 
@@ -121,7 +129,10 @@ async fn grpc_get_not_found_when_cache_empty() {
     let mut grpc = connect(port).await;
 
     let result = grpc
-        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: "nonexistent".into() }))
+        .get(Request::new(GetRequest {
+            namespace: NAMESPACE.into(),
+            name: "nonexistent".into(),
+        }))
         .await;
 
     assert!(result.is_err(), "Get must return NOT_FOUND for empty cache");
@@ -167,15 +178,24 @@ async fn grpc_get_all_streams_one_entry() {
     let mut grpc = connect(port).await;
 
     let resp = grpc
-        .get_all(Request::new(GetAllRequest { namespace: NAMESPACE.into() }))
+        .get_all(Request::new(GetAllRequest {
+            namespace: NAMESPACE.into(),
+        }))
         .await
         .expect("GetAll RPC failed");
 
     let mut stream = resp.into_inner();
-    let first = stream.next().await.expect("must yield one item").expect("no error");
+    let first = stream
+        .next()
+        .await
+        .expect("must yield one item")
+        .expect("no error");
     assert_eq!(first.schema_version, 3);
 
-    assert!(stream.next().await.is_none(), "must stream exactly one entry");
+    assert!(
+        stream.next().await.is_none(),
+        "must stream exactly one entry"
+    );
 
     maybe_delete(&client, NAMESPACE, CFG).await;
     watcher_handle.abort();
@@ -193,7 +213,11 @@ async fn grpc_apply_writes_config_and_get_reflects_it() {
     let watcher_client = client.clone();
     let watcher_handle = tokio::spawn(async move {
         Watcher::new(watcher_client)
-            .run(watcher_cache, NAMESPACE.to_string(), CFG_GRPC_APPLY.to_string())
+            .run(
+                watcher_cache,
+                NAMESPACE.to_string(),
+                CFG_GRPC_APPLY.to_string(),
+            )
             .await
             .expect("watcher error");
     });
@@ -213,7 +237,10 @@ async fn grpc_apply_writes_config_and_get_reflects_it() {
         .expect("Apply RPC failed");
 
     let rv = apply_resp.into_inner().resource_version;
-    assert!(!rv.is_empty(), "resource_version must be non-empty after Apply");
+    assert!(
+        !rv.is_empty(),
+        "resource_version must be non-empty after Apply"
+    );
 
     // Wait for watcher to deliver the Apply event.
     let cache_ref = Arc::clone(&cache);
@@ -228,7 +255,10 @@ async fn grpc_apply_writes_config_and_get_reflects_it() {
 
     // Get should now reflect schema_version=5.
     let get_resp = grpc
-        .get(Request::new(GetRequest { namespace: NAMESPACE.into(), name: CFG_GRPC_APPLY.into() }))
+        .get(Request::new(GetRequest {
+            namespace: NAMESPACE.into(),
+            name: CFG_GRPC_APPLY.into(),
+        }))
         .await
         .expect("Get after Apply failed");
 
@@ -282,7 +312,10 @@ async fn grpc_apply_rejects_schema_version_downgrade() {
         }))
         .await;
 
-    assert!(result.is_err(), "Apply with lesser schema_version must fail");
+    assert!(
+        result.is_err(),
+        "Apply with lesser schema_version must fail"
+    );
     assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
 
     maybe_delete(&client, NAMESPACE, CFG).await;

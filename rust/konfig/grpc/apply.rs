@@ -48,7 +48,10 @@ pub async fn apply_inner(
     let current = fetch_current_schema_version(&api, name).await?;
 
     if incoming <= current {
-        warn!(incoming, current, "Apply rejected: schema_version not increasing");
+        warn!(
+            incoming,
+            current, "Apply rejected: schema_version not increasing"
+        );
         return Err(Status::failed_precondition(format!(
             "schema_version must be > {current}; got {incoming}"
         )));
@@ -66,7 +69,9 @@ pub async fn apply_inner(
 
     info!(namespace, name, schema_version = incoming, resource_version = %rv, "Apply succeeded");
 
-    Ok(Response::new(ApplyResponse { resource_version: rv }))
+    Ok(Response::new(ApplyResponse {
+        resource_version: rv,
+    }))
 }
 
 async fn fetch_current_schema_version(api: &Api<DynamicObject>, name: &str) -> Result<u32, Status> {
@@ -98,7 +103,11 @@ async fn patch_with_retry(
             Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
             Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
                 let delay = RETRY_DELAYS_MS[attempt];
-                warn!(attempt = attempt + 1, delay_ms = delay, "Apply: 409 Conflict — retrying");
+                warn!(
+                    attempt = attempt + 1,
+                    delay_ms = delay,
+                    "Apply: 409 Conflict — retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 attempt += 1;
             }

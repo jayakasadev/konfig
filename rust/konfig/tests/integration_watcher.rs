@@ -108,7 +108,11 @@ async fn watcher_retains_cache_on_config_delete() {
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Cache must retain last-known-good.
-    assert_eq!(cache.load().schema_version, 5, "cache must retain schema_version=5 after deletion");
+    assert_eq!(
+        cache.load().schema_version,
+        5,
+        "cache must retain schema_version=5 after deletion"
+    );
 
     watcher.abort();
 }

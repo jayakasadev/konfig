@@ -42,8 +42,10 @@ pub async fn apply_secret_inner(
     let plaintext_map: BTreeMap<String, String> = serde_yaml::from_str(yaml_content)
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
-    let incoming_version: u32 =
-        plaintext_map.get("schema_version").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let incoming_version: u32 = plaintext_map
+        .get("schema_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let secrets: Api<Secret> = Api::namespaced(kube_client.clone(), namespace);
     let current_version = fetch_current_secret_version(&secrets, name).await?;
@@ -119,7 +121,10 @@ async fn patch_secret_with_retry(
             }),
             annotations: Some({
                 let mut a = BTreeMap::new();
-                a.insert(SCHEMA_VERSION_ANNOTATION.to_string(), schema_version.to_string());
+                a.insert(
+                    SCHEMA_VERSION_ANNOTATION.to_string(),
+                    schema_version.to_string(),
+                );
                 a
             }),
             ..Default::default()
@@ -139,12 +144,17 @@ async fn patch_secret_with_retry(
             }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 && attempt < RETRY_DELAYS_MS.len() => {
                 let delay_ms = RETRY_DELAYS_MS[attempt];
-                warn!(attempt = attempt + 1, delay_ms, "ApplySecret: 409 — retrying");
+                warn!(
+                    attempt = attempt + 1,
+                    delay_ms, "ApplySecret: 409 — retrying"
+                );
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 attempt += 1;
             }
             Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
-                return Err(Status::aborted("ApplySecret: 409 Conflict — exceeded max retries"));
+                return Err(Status::aborted(
+                    "ApplySecret: 409 Conflict — exceeded max retries",
+                ));
             }
             Err(e) => {
                 return Err(Status::unavailable(format!("kube patch error: {e}")));

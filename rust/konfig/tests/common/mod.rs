@@ -30,11 +30,17 @@ pub async fn k3s_client() -> (ContainerAsync<K3s>, kube::Client) {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let kubeconfig_yaml = container.image().read_kube_config().expect("read kubeconfig");
+    let kubeconfig_yaml = container
+        .image()
+        .read_kube_config()
+        .expect("read kubeconfig");
     let mut kube_config =
         kube::config::Kubeconfig::from_yaml(&kubeconfig_yaml).expect("parse kubeconfig");
 
-    let host_port = container.get_host_port_ipv4(KUBE_SECURE_PORT).await.expect("K3s host port");
+    let host_port = container
+        .get_host_port_ipv4(KUBE_SECURE_PORT)
+        .await
+        .expect("K3s host port");
 
     kube_config.clusters.iter_mut().for_each(|named| {
         if let Some(c) = named.cluster.as_mut() {
@@ -70,10 +76,15 @@ fn load_crd_yaml() -> String {
         .and_then(|dir| std::fs::read_to_string(std::path::Path::new(&dir).join(BAZEL_REL)).ok())
         .or_else(|| {
             // cargo test: CARGO_MANIFEST_DIR is rust/konfig — workspace root is 2 levels up.
-            std::env::var("CARGO_MANIFEST_DIR").ok().and_then(|manifest| {
-                let workspace = std::path::Path::new(&manifest).ancestors().nth(2)?.to_path_buf();
-                std::fs::read_to_string(workspace.join(CARGO_REL)).ok()
-            })
+            std::env::var("CARGO_MANIFEST_DIR")
+                .ok()
+                .and_then(|manifest| {
+                    let workspace = std::path::Path::new(&manifest)
+                        .ancestors()
+                        .nth(2)?
+                        .to_path_buf();
+                    std::fs::read_to_string(workspace.join(CARGO_REL)).ok()
+                })
         })
         .expect("infra/konfig/crd.yaml not found — run via bazel test or cargo test from repo root")
 }
@@ -94,7 +105,9 @@ pub async fn install_crd(client: &kube::Client) {
 
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &crd_ar);
     let pp = PatchParams::apply("konfig-test").force();
-    api.patch("configs.konfig.io", &pp, &Patch::Apply(crd_value)).await.expect("apply Config CRD");
+    api.patch("configs.konfig.io", &pp, &Patch::Apply(crd_value))
+        .await
+        .expect("apply Config CRD");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
@@ -118,7 +131,13 @@ pub async fn upsert_config(
         "spec": { "schema_version": schema_version, "content": content }
     });
 
-    match api.create(&PostParams::default(), &serde_json::from_value(body.clone()).unwrap()).await {
+    match api
+        .create(
+            &PostParams::default(),
+            &serde_json::from_value(body.clone()).unwrap(),
+        )
+        .await
+    {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
             maybe_delete(client, namespace, name).await;
@@ -155,6 +174,9 @@ where
 
 pub fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
     format!("{nanos:08x}")
 }

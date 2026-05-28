@@ -16,8 +16,8 @@ use kube::api::{WatchEvent, WatchParams};
 use kube::core::DynamicObject;
 use kube::runtime::watcher::{self as kube_watcher, Event, watcher as kube_watch_stream};
 use kube::{Api, Client};
-use tokio::sync::{broadcast, mpsc};
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
@@ -63,11 +63,7 @@ pub async fn handle_subscribe(
     }
 
     // Broadcast path: get or create the shared sender for this namespace.
-    let bcast_rx = get_or_create_broadcast(
-        namespace.clone(),
-        kube_client,
-        namespace_broadcasts,
-    );
+    let bcast_rx = get_or_create_broadcast(namespace.clone(), kube_client, namespace_broadcasts);
 
     // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
     tokio::spawn(bridge_broadcast(bcast_rx, tx));
@@ -237,7 +233,10 @@ async fn emit_to_mpsc(
     let Some(snap) = crate::watcher::parse_config_object(&obj) else {
         return true;
     };
-    let config_event = ConfigEvent { event_type, config: Some(snapshot_to_proto(&snap)) };
+    let config_event = ConfigEvent {
+        event_type,
+        config: Some(snapshot_to_proto(&snap)),
+    };
     match tx.try_send(Ok(config_event)) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {

@@ -130,7 +130,10 @@ mod tests {
         s.metadata.resource_version = Some("rv-001".to_string());
         s.metadata.annotations = Some({
             let mut a = BTreeMap::new();
-            a.insert(SCHEMA_VERSION_ANNOTATION.to_string(), schema_version.to_string());
+            a.insert(
+                SCHEMA_VERSION_ANNOTATION.to_string(),
+                schema_version.to_string(),
+            );
             a
         });
         s.data = Some(data);
