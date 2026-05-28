@@ -1,0 +1,75 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      # Bazel disk cache — keyed on MODULE.bazel.lock + Cargo.lock so cache
+      # stays valid across commits that don't change deps.
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-disk-cache
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel.lock', 'Cargo.lock') }}
+          restore-keys: bazel-${{ runner.os }}-
+
+      - name: Configure disk cache path
+        run: echo "build --disk_cache=$HOME/.cache/bazel-disk-cache" >> .bazelrc.user
+
+      - name: Build
+        run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli
+
+      - name: Test
+        run: bazel test //rust/konfig:test //tools/konfig-cli:... --test_output=errors
+
+      - name: Clippy
+        run: bazel test //rust/konfig:clippy_test //tools/konfig-cli:clippy_test
+
+  integration-tests:
+    name: Integration tests (K3s)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'run-integration')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git
+            target
+          key: cargo-konfig-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-konfig-
+
+      - name: Run integration tests
+        run: |
+          cargo test -p konfig \
+            --features integration \
+            -- --nocapture --test-threads=1
+        env:
+          RUST_LOG: konfig=debug,kube=info
+          TESTCONTAINERS_RYUK_DISABLED: "false"

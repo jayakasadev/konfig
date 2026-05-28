@@ -1,0 +1,123 @@
+"""
+konfig — generic Kubernetes config distribution service.
+
+Standalone Bazel module. Consumed by other Bazel workspaces via:
+
+    bazel_dep(name = "konfig", version = "0.1.0")
+    git_override(
+        module_name = "konfig",
+        remote = "https://github.com/jayakasadev/konfig.git",
+        commit = "<sha>",
+    )
+
+Public targets:
+    @konfig//rust/konfig:konfig          — Rust library crate
+    @konfig//rust/konfig:konfig_bin      — server binary
+    @konfig//tools/konfig-cli:konfig_cli — CLI binary
+    @konfig//proto/konfig/v1:konfig_service_proto — proto_library
+"""
+
+module(
+    name = "konfig",
+    version = "0.1.0",
+    compatibility_level = 1,
+)
+
+##################################
+# Core rules
+##################################
+bazel_dep(name = "rules_rust", version = "")
+bazel_dep(name = "platforms", version = "0.0.11")
+bazel_dep(name = "bazel_skylib", version = "1.8.1")
+bazel_dep(name = "aspect_bazel_lib", version = "2.14.0")
+
+archive_override(
+    module_name = "rules_rust",
+    integrity = "sha256-M0pWfqFlvnFwxMqJ2t56Yu7HveOtEZhup5qxHQTh2ig=",
+    strip_prefix = "rules_rust-19beae81b7b97b2bf4135f9f2f1a6f63477adde2",
+    urls = ["https://github.com/bazelbuild/rules_rust/archive/19beae81b7b97b2bf4135f9f2f1a6f63477adde2.tar.gz"],
+)
+
+##################################
+# Rust toolchain
+##################################
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.95.0"],
+)
+use_repo(rust, "rust_toolchains")
+register_toolchains("@rust_toolchains//:all")
+
+##################################
+# Protobuf
+##################################
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "protobuf", version = "29.3")
+bazel_dep(name = "rules_rust_prost", version = "0.69.0")
+bazel_dep(name = "rules_rust_protobuf", version = "0.69.0")
+
+##################################
+# OCI images
+##################################
+bazel_dep(name = "rules_oci", version = "2.3.0")
+bazel_dep(name = "rules_pkg", version = "1.2.0")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "distroless_cc",
+    image = "gcr.io/distroless/cc-debian13",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64/v8",
+    ],
+    tag = "nonroot",
+)
+use_repo(oci,
+    "distroless_cc",
+    "distroless_cc_linux_amd64",
+    "distroless_cc_linux_arm64_v8",
+)
+
+##################################
+# LLVM cross-compilation toolchain
+##################################
+bazel_dep(name = "toolchains_llvm", version = "1.7.0")
+
+archive_override(
+    module_name = "toolchains_llvm",
+    integrity = "sha256-rnk2El123pJdGmd3czxchUP2DOVe7caJtfeTqzKhgkM=",
+    strip_prefix = "toolchains_llvm-3aad06c2d166cd89a09236694ecd9bf0f1c1b37d",
+    urls = ["https://github.com/bazel-contrib/toolchains_llvm/archive/3aad06c2d166cd89a09236694ecd9bf0f1c1b37d.tar.gz"],
+)
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    cxx_standard = {"": "c++23"},
+    llvm_versions = {
+        "": "21.1.8",
+        "darwin-aarch64": "20.1.8",
+    },
+    stdlib = {
+        "aarch64-unknown-linux-gnu": "libc++",
+        "x86_64-unknown-linux-gnu": "libc++",
+    },
+)
+use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
+register_toolchains("@llvm_toolchain//:all")
+
+##################################
+# Crate universe — all konfig Rust deps
+##################################
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+    supported_platform_triples = [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "crates")

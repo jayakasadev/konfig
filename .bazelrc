@@ -1,0 +1,14 @@
+# Disk cache — populated by GHA actions/cache; speeds up incremental CI builds.
+build --disk_cache=~/.cache/bazel-disk-cache
+
+# Required for tokio-console and dial9-tokio-telemetry.
+build --@rules_rust//:extra_rustc_flags=--cfg=tokio_unstable
+build --@rules_rust//:extra_rustc_flags=-Cforce-frame-pointers=yes
+
+# CI profile — disable disk cache path expansion for remote runners.
+build:ci --disk_cache=
+
+# Release profile — optimised binaries.
+build:release -c opt
+build:release --@rules_rust//:extra_rustc_flags=-Cpanic=abort
+build:release --@rules_rust//:extra_rustc_flags=-Cstrip=symbols
