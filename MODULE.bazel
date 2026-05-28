@@ -54,7 +54,7 @@ rust.toolchain(
     versions = ["1.95.0"],
 )
 use_repo(rust, "rust_toolchains")
-register_toolchains("@rust_toolchains//:all")
+register_toolchains("@rust_toolchains//:all", dev_dependency = True)
 
 ##################################
 # Protobuf
@@ -114,7 +114,7 @@ llvm.toolchain(
     },
 )
 use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
-register_toolchains("@konfig_llvm_toolchain//:all")
+register_toolchains("@konfig_llvm_toolchain//:all", dev_dependency = True)
 
 ##################################
 # Crate universe — konfig's Rust deps
