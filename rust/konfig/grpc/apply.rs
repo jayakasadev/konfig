@@ -7,7 +7,7 @@
 //! 4. Patch the CRD with server-side apply; retry 409 up to 3 times.
 //! 5. Return `ApplyResponse { resource_version }`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kube::Client;
 use kube::api::{Api, Patch, PatchParams};
@@ -16,7 +16,7 @@ use serde_json::json;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
-use crate::metrics::APPLY_TOTAL;
+use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
 use crate::proto::{ApplyRequest, ApplyResponse};
 use crate::types::ConfigSpec;
 use crate::watcher::{GROUP, VERSION, config_api_resource};
@@ -38,6 +38,7 @@ pub async fn apply_inner(
     yaml_content: &str,
     kube_client: Client,
 ) -> Result<Response<ApplyResponse>, Status> {
+    let started = Instant::now();
     let spec: ConfigSpec = serde_yaml::from_str(yaml_content)
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
@@ -56,6 +57,9 @@ pub async fn apply_inner(
         APPLY_TOTAL
             .with_label_values(&[namespace, "rejected"])
             .inc();
+        APPLY_DURATION
+            .with_label_values(&[namespace, "rejected"])
+            .observe(started.elapsed().as_secs_f64());
         return Err(Status::failed_precondition(format!(
             "schema_version must be > {current}; got {incoming}"
         )));
@@ -73,12 +77,18 @@ pub async fn apply_inner(
         Ok(rv) => {
             info!(namespace, name, schema_version = incoming, resource_version = %rv, "Apply succeeded");
             APPLY_TOTAL.with_label_values(&[namespace, "ok"]).inc();
+            APPLY_DURATION
+                .with_label_values(&[namespace, "ok"])
+                .observe(started.elapsed().as_secs_f64());
             Ok(Response::new(ApplyResponse {
                 resource_version: rv,
             }))
         }
         Err(e) => {
             APPLY_TOTAL.with_label_values(&[namespace, "error"]).inc();
+            APPLY_DURATION
+                .with_label_values(&[namespace, "error"])
+                .observe(started.elapsed().as_secs_f64());
             Err(e)
         }
     }

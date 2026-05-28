@@ -8,7 +8,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dashmap::DashMap;
-use prometheus::{CounterVec, GaugeVec, register_counter_vec, register_gauge_vec};
+use prometheus::{
+    CounterVec, GaugeVec, HistogramVec, register_counter_vec, register_gauge_vec,
+    register_histogram_vec,
+};
+
+/// Latency buckets for Apply and Get RPC handlers, in seconds.
+/// Covers sub-ms cache hits up to multi-second kube round-trips.
+const RPC_LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Latency buckets for Subscribe broadcast-to-receive end-to-end measurement,
+/// in seconds.  Subscribe fan-out is purely in-process so the floor is much
+/// lower than for kube-backed RPCs — buckets start at 100 µs.
+const SUBSCRIBE_LATENCY_BUCKETS: &[f64] = &[
+    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0,
+];
 
 lazy_static::lazy_static! {
     /// Current number of active gRPC Subscribe streams, by namespace.
@@ -64,6 +80,35 @@ lazy_static::lazy_static! {
         &["namespace", "result"]
     )
     .expect("failed to register konfig_apply_total");
+
+    /// Apply RPC handler latency, by namespace and result (ok / rejected / error).
+    pub static ref APPLY_DURATION: HistogramVec = register_histogram_vec!(
+        "konfig_apply_duration_seconds",
+        "Apply RPC handler duration in seconds",
+        &["namespace", "result"],
+        RPC_LATENCY_BUCKETS.to_vec()
+    )
+    .expect("failed to register konfig_apply_duration_seconds");
+
+    /// Get / GetAll RPC handler latency, by namespace.
+    pub static ref GET_DURATION: HistogramVec = register_histogram_vec!(
+        "konfig_get_duration_seconds",
+        "Get/GetAll RPC handler duration in seconds",
+        &["namespace"],
+        RPC_LATENCY_BUCKETS.to_vec()
+    )
+    .expect("failed to register konfig_get_duration_seconds");
+
+    /// Subscribe end-to-end latency: from `broadcast::send` in the namespace
+    /// watcher to the moment each subscriber's bridge enqueues the event onto
+    /// its per-client mpsc channel.  Observed once per subscriber per event.
+    pub static ref SUBSCRIBE_E2E_LATENCY: HistogramVec = register_histogram_vec!(
+        "konfig_subscribe_e2e_latency_seconds",
+        "Subscribe end-to-end latency (broadcast send to subscriber mpsc enqueue) in seconds",
+        &["namespace"],
+        SUBSCRIBE_LATENCY_BUCKETS.to_vec()
+    )
+    .expect("failed to register konfig_subscribe_e2e_latency_seconds");
 }
 
 /// RAII guard that decrements `ACTIVE_SUBSCRIBERS` for `namespace` on drop.
@@ -209,6 +254,56 @@ mod tests {
                 "apply_total[{result}] must increment"
             );
         }
+    }
+
+    #[test]
+    fn apply_duration_histogram_records_observations() {
+        let ns = "test-ns-apply-duration";
+        let before = APPLY_DURATION
+            .with_label_values(&[ns, "ok"])
+            .get_sample_count();
+        APPLY_DURATION.with_label_values(&[ns, "ok"]).observe(0.012);
+        APPLY_DURATION.with_label_values(&[ns, "ok"]).observe(0.345);
+        assert_eq!(
+            APPLY_DURATION
+                .with_label_values(&[ns, "ok"])
+                .get_sample_count(),
+            before + 2,
+        );
+        assert!(
+            APPLY_DURATION
+                .with_label_values(&[ns, "ok"])
+                .get_sample_sum()
+                >= 0.357 - f64::EPSILON,
+        );
+    }
+
+    #[test]
+    fn get_duration_histogram_records_observations() {
+        let ns = "test-ns-get-duration";
+        let before = GET_DURATION.with_label_values(&[ns]).get_sample_count();
+        GET_DURATION.with_label_values(&[ns]).observe(0.001);
+        assert_eq!(
+            GET_DURATION.with_label_values(&[ns]).get_sample_count(),
+            before + 1,
+        );
+    }
+
+    #[test]
+    fn subscribe_e2e_latency_histogram_records_observations() {
+        let ns = "test-ns-sub-latency";
+        let before = SUBSCRIBE_E2E_LATENCY
+            .with_label_values(&[ns])
+            .get_sample_count();
+        SUBSCRIBE_E2E_LATENCY
+            .with_label_values(&[ns])
+            .observe(0.0003);
+        assert_eq!(
+            SUBSCRIBE_E2E_LATENCY
+                .with_label_values(&[ns])
+                .get_sample_count(),
+            before + 1,
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ use tonic::{Request, Response, Status};
 use tracing::info;
 
 use crate::cache::ConfigCache;
-use crate::grpc::subscribe::{ReplayBuffer, gc_task};
+use crate::grpc::subscribe::{BroadcastFrame, ReplayBuffer, gc_task};
 use crate::metrics::{LastEventAtMap, REPLAY_BUFFER_DEPTH, STALE_SECONDS};
 use crate::proto::{
     ApplyRequest, ApplyResponse, ApplySecretRequest, ApplySecretResponse, Config, ConfigEvent,
@@ -67,7 +67,7 @@ pub struct KonfigServer {
     /// subscriber gets a `Receiver` clone (O(1) fan-out).
     /// Events are wrapped in `Arc` so broadcast clones are reference-count
     /// increments only — serialisation happens once per apply, not per subscriber.
-    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     /// Per-namespace replay buffer for the `resume_resource_version` reconnect
     /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
     /// can catch up without opening a new kube watch.
@@ -166,7 +166,7 @@ impl KonfigService for KonfigServer {
 pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     info!(addr = %cfg.addr, "KonfigService gRPC server starting");
 
-    let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+    let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
         Arc::new(DashMap::new());
     let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
     let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
