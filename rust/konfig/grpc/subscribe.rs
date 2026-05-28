@@ -33,8 +33,25 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ConfigCache;
 use crate::grpc::snapshot_to_proto;
-use crate::metrics::{ACTIVE_SUBSCRIBERS, BROADCAST_LAG, EVENTS_BROADCAST, SubGauge};
+use crate::metrics::{
+    ACTIVE_SUBSCRIBERS, BROADCAST_LAG, EVENTS_BROADCAST, SUBSCRIBE_E2E_LATENCY, SubGauge,
+};
 use crate::proto::{ConfigEvent, SubscribeRequest, config_event::EventType};
+
+/// Outer envelope that the namespace watcher publishes onto the broadcast
+/// channel.  Carries the moment `broadcast::Sender::send` was called so each
+/// subscriber's bridge can observe end-to-end latency in
+/// `konfig_subscribe_e2e_latency_seconds`.
+///
+/// `event` is kept behind `Arc` so the inner `ConfigEvent` is still serialised
+/// exactly once per apply (Track E invariant) — only this thin outer envelope
+/// is added, and it is itself wrapped in an `Arc` at the broadcast layer so
+/// every receiver shares the same allocation.
+#[derive(Debug)]
+pub struct BroadcastFrame {
+    pub sent_at: Instant,
+    pub event: Arc<ConfigEvent>,
+}
 
 /// Per-subscriber mpsc capacity — back-pressure for slow readers.
 const CHANNEL_CAPACITY: usize = 256;
@@ -74,7 +91,7 @@ fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEv
 pub async fn handle_subscribe(
     cache: Arc<ConfigCache>,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     req: SubscribeRequest,
@@ -125,10 +142,10 @@ pub async fn handle_subscribe(
 fn get_or_create_broadcast(
     namespace: String,
     kube_client: Client,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
-) -> (broadcast::Receiver<Arc<ConfigEvent>>, ReplayBuffer) {
+) -> (broadcast::Receiver<Arc<BroadcastFrame>>, ReplayBuffer) {
     // Fast path: namespace already has a running watcher.
     if let Some(sender) = namespace_broadcasts.get(&namespace) {
         let buf = namespace_replay_buffers
@@ -186,9 +203,9 @@ fn get_or_create_broadcast(
 async fn run_namespace_watcher(
     namespace: String,
     kube_client: Client,
-    tx: broadcast::Sender<Arc<ConfigEvent>>,
+    tx: broadcast::Sender<Arc<BroadcastFrame>>,
     replay_buf: ReplayBuffer,
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
 ) {
     let ar = crate::watcher::config_api_resource();
@@ -215,10 +232,20 @@ async fn run_namespace_watcher(
 
         // Push into replay buffer before broadcasting so a subscriber that
         // races to read the buffer after receiving the live event will find it.
+        // Replay path is decoupled from the broadcast envelope — it only needs
+        // the inner Arc<ConfigEvent>.
         push_replay(&replay_buf, rv, Arc::clone(&config_event));
 
+        // Wrap the event in a BroadcastFrame and stamp the send time *as
+        // close to broadcast::send as possible* so the latency histogram
+        // measures the broadcast-to-receive path, not upstream work.
+        let frame = Arc::new(BroadcastFrame {
+            sent_at: Instant::now(),
+            event: config_event,
+        });
+
         // `send` returns Err only when there are zero receivers — drop the event.
-        if tx.send(config_event).is_ok() {
+        if tx.send(frame).is_ok() {
             EVENTS_BROADCAST.with_label_values(&[&namespace]).inc();
         }
     }
@@ -245,7 +272,7 @@ const GC_GRACE: Duration = Duration::from_secs(30);
 /// feature (no `tokio::time::pause` / `advance` required).
 pub fn gc_tick(
     now: Instant,
-    namespace_broadcasts: &DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>,
+    namespace_broadcasts: &DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>,
     namespace_replay_buffers: &DashMap<String, ReplayBuffer>,
     watcher_handles: &DashMap<String, JoinHandle<()>>,
     idle_since: &DashMap<String, Instant>,
@@ -299,7 +326,7 @@ pub fn gc_tick(
 /// - Never hold a DashMap entry ref (`.get()`, `.entry()`) across an `.await`.
 /// - The GC list is collected to a `Vec` inside `gc_tick` before any mutations.
 pub async fn gc_task(
-    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
+    namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>>,
     namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>>,
     watcher_handles: Arc<DashMap<String, JoinHandle<()>>>,
     idle_since: Arc<DashMap<String, Instant>>,
@@ -329,7 +356,7 @@ async fn resume_from_buffer(
     replay_buf: ReplayBuffer,
     cache: Arc<ConfigCache>,
     namespace: String,
-    bcast_rx: broadcast::Receiver<Arc<ConfigEvent>>,
+    bcast_rx: broadcast::Receiver<Arc<BroadcastFrame>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
 ) {
     // Collect the replay slice under the lock, then release before doing I/O.
@@ -454,10 +481,16 @@ async fn resume_from_buffer(
 
 /// Forward events from the namespace broadcast to a single subscriber's mpsc.
 ///
-/// Receives `Arc<ConfigEvent>` from the broadcast — O(1) reference-count clone
-/// per receiver.  Dereferences the Arc to produce the `ConfigEvent` value sent
-/// over the per-subscriber mpsc channel (tonic's `ReceiverStream` takes owned
-/// values, not Arc).
+/// Receives `Arc<BroadcastFrame>` from the broadcast — O(1) reference-count
+/// clone per receiver.  The frame carries the `sent_at` instant stamped by
+/// `run_namespace_watcher` immediately before `broadcast::send`; we observe
+/// `sent_at.elapsed()` BEFORE forwarding to the mpsc so the histogram
+/// measures the broadcast-to-receive path (not the downstream mpsc enqueue
+/// of the per-subscriber channel, which is bounded by `try_send`).
+///
+/// Dereferences the inner Arc<ConfigEvent> to produce the `ConfigEvent` value
+/// sent over the per-subscriber mpsc channel (tonic's `ReceiverStream` takes
+/// owned values, not Arc).
 ///
 /// Disconnects the subscriber with RESOURCE_EXHAUSTED if:
 /// - the mpsc channel is full (subscriber too slow to drain), or
@@ -465,9 +498,10 @@ async fn resume_from_buffer(
 ///
 /// Increments `konfig_active_subscribers` on entry and decrements on every
 /// exit path via a `SubGauge` RAII guard.  Increments
-/// `konfig_broadcast_lag_total` when the broadcast ring wraps.
+/// `konfig_broadcast_lag_total` when the broadcast ring wraps and
+/// `konfig_subscribe_e2e_latency_seconds` on every successful receive.
 async fn bridge_broadcast(
-    mut bcast_rx: broadcast::Receiver<Arc<ConfigEvent>>,
+    mut bcast_rx: broadcast::Receiver<Arc<BroadcastFrame>>,
     tx: mpsc::Sender<Result<ConfigEvent, Status>>,
     namespace: String,
 ) {
@@ -477,18 +511,28 @@ async fn bridge_broadcast(
 
     loop {
         match bcast_rx.recv().await {
-            Ok(event) => match tx.try_send(Ok((*event).clone())) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
-                    let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                    break;
+            Ok(frame) => {
+                // Observe end-to-end latency BEFORE forwarding — measures the
+                // broadcast send→receive path only.  `sent_at.elapsed()` is a
+                // monotonic delta; it cannot go negative even under wall-clock
+                // jumps.
+                SUBSCRIBE_E2E_LATENCY
+                    .with_label_values(&[&namespace])
+                    .observe(frame.sent_at.elapsed().as_secs_f64());
+
+                match tx.try_send(Ok((*frame.event).clone())) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        warn!("Subscriber too slow — disconnecting with RESOURCE_EXHAUSTED");
+                        let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                        break;
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        info!("Subscriber disconnected");
+                        break;
+                    }
                 }
-                Err(TrySendError::Closed(_)) => {
-                    info!("Subscriber disconnected");
-                    break;
-                }
-            },
+            }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!(missed = n, "Subscriber lagged — disconnecting");
                 BROADCAST_LAG.with_label_values(&[&namespace]).inc();
@@ -521,6 +565,15 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    /// Wrap a `ConfigEvent` in a fresh `BroadcastFrame` for tests that need
+    /// to inject events into a broadcast channel.
+    fn make_frame(event: ConfigEvent) -> Arc<BroadcastFrame> {
+        Arc::new(BroadcastFrame {
+            sent_at: Instant::now(),
+            event: Arc::new(event),
+        })
     }
 
     fn make_replay_buf(entries: &[(&str, u32)]) -> ReplayBuffer {
@@ -611,7 +664,7 @@ mod tests {
             ("rv-5", 5),
         ]);
         let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         // Close the broadcast sender so bridge_broadcast exits cleanly after replay.
@@ -646,7 +699,7 @@ mod tests {
         let replay_buf = make_replay_buf(&[("rv-10", 10), ("rv-11", 11), ("rv-12", 12)]);
         // Cache has two entries.
         let cache = make_cache("default", &[("cfg-a", "rv-13", 13), ("cfg-b", "rv-14", 14)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         drop(bcast_tx); // let bridge_broadcast exit cleanly
@@ -687,7 +740,7 @@ mod tests {
         let cache = make_cache("default", &[("cfg", "rv-3", 3)]);
 
         // Pre-create a broadcast channel to simulate an already-running watcher.
-        let (bcast_tx, _initial_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, _initial_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
 
         let mut handles = Vec::new();
         for _ in 0..10 {
@@ -731,14 +784,14 @@ mod tests {
     async fn resume_at_latest_rv_joins_live_broadcast() {
         let replay_buf = make_replay_buf(&[("rv-5", 5)]);
         let cache = make_cache("default", &[("cfg", "rv-5", 5)]);
-        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
         let bcast_tx_clone = bcast_tx.clone();
         tokio::spawn(async move {
             // Send one live event after a short delay.
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = bcast_tx_clone.send(Arc::new(make_event("rv-6", 6)));
+            let _ = bcast_tx_clone.send(make_frame(make_event("rv-6", 6)));
             drop(bcast_tx_clone);
         });
 
@@ -791,7 +844,7 @@ mod tests {
         // Cache reflects the state at the snapshot: only rv-5.
         let cache = make_cache("default", &[("cfg", "5", 5)]);
 
-        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(128);
 
         // Close the broadcast sender so bridge_broadcast exits cleanly after
@@ -825,17 +878,19 @@ mod tests {
 
     // ── Async: broadcast_arc_not_cloned — all receivers share one allocation ──
     //
-    // Spawn 10 receiver tasks on a `broadcast::channel::<Arc<ConfigEvent>>`,
-    // send 1 event, verify all 10 receivers get a pointer to the SAME allocation.
-    // This confirms that the broadcast distributes reference-count increments
-    // only — no deep copy of the proto struct per subscriber.
+    // Spawn 10 receiver tasks on a `broadcast::channel::<Arc<BroadcastFrame>>`,
+    // send 1 frame, verify all 10 receivers get a pointer to the SAME inner
+    // `Arc<ConfigEvent>` allocation.  This confirms that the broadcast still
+    // serialises the proto exactly once per apply (Track E invariant) — the
+    // BroadcastFrame envelope only carries a timing field and a refcount-bump
+    // clone of the inner Arc.
 
     #[tokio::test]
     async fn broadcast_arc_not_cloned() {
-        let (bcast_tx, _) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (bcast_tx, _) = broadcast::channel::<Arc<BroadcastFrame>>(64);
 
         const N: usize = 10;
-        let mut handles: Vec<tokio::task::JoinHandle<Arc<ConfigEvent>>> = Vec::with_capacity(N);
+        let mut handles: Vec<tokio::task::JoinHandle<Arc<BroadcastFrame>>> = Vec::with_capacity(N);
 
         for _ in 0..N {
             let mut rx = bcast_tx.subscribe();
@@ -844,30 +899,36 @@ mod tests {
         }
 
         let event = Arc::new(make_event("rv-1", 1));
-        // Record the pointer before sending (numeric address of the heap allocation).
-        let expected_ptr = Arc::as_ptr(&event) as usize;
+        // Record the pointer to the *inner* ConfigEvent allocation before sending.
+        let expected_inner_ptr = Arc::as_ptr(&event) as usize;
 
-        bcast_tx.send(event).expect("send failed");
+        let frame = Arc::new(BroadcastFrame {
+            sent_at: Instant::now(),
+            event,
+        });
+        bcast_tx.send(frame).expect("send failed");
 
-        let mut received_arcs = Vec::with_capacity(N);
+        let mut received_frames = Vec::with_capacity(N);
         for h in handles {
             let arc = h.await.expect("task panicked");
-            received_arcs.push(arc);
+            received_frames.push(arc);
         }
 
-        // All receivers must hold a reference to the SAME allocation — the
-        // broadcast clones only the Arc (refcount bump), not the ConfigEvent.
-        for arc in &received_arcs {
+        // All receivers must hold a reference to the SAME inner allocation —
+        // the broadcast clones only Arc<BroadcastFrame> (refcount bump), and
+        // the inner Arc<ConfigEvent> is the SAME heap object across all
+        // receivers.
+        for frame in &received_frames {
             assert!(
-                Arc::ptr_eq(received_arcs.first().unwrap(), arc),
-                "all receivers must point to the same Arc allocation"
+                Arc::ptr_eq(&received_frames.first().unwrap().event, &frame.event),
+                "all receivers must point to the same inner ConfigEvent allocation"
             );
         }
-        // Also verify the pointer matches what was sent.
+        // Also verify the inner pointer matches what was sent.
         assert_eq!(
-            Arc::as_ptr(received_arcs.first().unwrap()) as usize,
-            expected_ptr,
-            "received Arc must be the same allocation as the one sent"
+            Arc::as_ptr(&received_frames.first().unwrap().event) as usize,
+            expected_inner_ptr,
+            "received inner Arc must be the same allocation as the one sent"
         );
     }
 
@@ -882,14 +943,14 @@ mod tests {
     /// feature of the `tokio` crate.
     #[tokio::test]
     async fn gc_removes_idle_namespace_after_grace_period() {
-        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
             Arc::new(DashMap::new());
         let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
         let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
         let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Insert a broadcast channel with NO active receivers (sender only).
-        let (tx, _rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (tx, _rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         // Drop _rx so receiver_count() == 0.
         drop(_rx);
         namespace_broadcasts.insert("test-ns".to_string(), tx);
@@ -938,14 +999,14 @@ mod tests {
     /// even when called with a `now` far in the future.
     #[tokio::test]
     async fn gc_does_not_remove_namespace_with_active_subscriber() {
-        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>> =
+        let namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<BroadcastFrame>>>> =
             Arc::new(DashMap::new());
         let namespace_replay_buffers: Arc<DashMap<String, ReplayBuffer>> = Arc::new(DashMap::new());
         let watcher_handles: Arc<DashMap<String, JoinHandle<()>>> = Arc::new(DashMap::new());
         let idle_since: Arc<DashMap<String, Instant>> = Arc::new(DashMap::new());
 
         // Insert a broadcast channel AND keep a live receiver so receiver_count() > 0.
-        let (tx, _live_rx) = broadcast::channel::<Arc<ConfigEvent>>(64);
+        let (tx, _live_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         namespace_broadcasts.insert("active-ns".to_string(), tx);
         namespace_replay_buffers.insert(
             "active-ns".to_string(),
@@ -973,5 +1034,60 @@ mod tests {
 
         // Keep _live_rx alive until here so receiver_count() stays > 0.
         drop(_live_rx);
+    }
+
+    // ── Async: bridge_broadcast observes konfig_subscribe_e2e_latency ─────────
+    //
+    // Spawn the bridge, broadcast 5 BroadcastFrames with `sent_at = now`, and
+    // verify the histogram sample count increased by exactly 5 (one observation
+    // per delivered event) with non-zero observed values.
+    #[tokio::test]
+    async fn subscribe_e2e_latency_records() {
+        let ns = "test-ns-bridge-latency";
+        let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        let before = SUBSCRIBE_E2E_LATENCY
+            .with_label_values(&[ns])
+            .get_sample_count();
+
+        // Spawn bridge.
+        let bridge = tokio::spawn(bridge_broadcast(bcast_rx, tx, ns.to_string()));
+
+        // Broadcast 5 frames with the send timestamp slightly in the past so
+        // each `sent_at.elapsed()` is strictly positive.
+        for i in 0..5 {
+            let event = Arc::new(make_event(&format!("rv-{i}"), i as u32 + 1));
+            let frame = Arc::new(BroadcastFrame {
+                sent_at: Instant::now() - Duration::from_millis(1),
+                event,
+            });
+            bcast_tx.send(frame).expect("send failed");
+        }
+
+        // Drain the 5 events on the mpsc to ensure the bridge processed them all.
+        for _ in 0..5 {
+            let _ = rx.recv().await.expect("must receive event");
+        }
+
+        // Drop the only sender so the bridge exits cleanly via RecvError::Closed.
+        drop(bcast_tx);
+        bridge.await.expect("bridge task panicked");
+
+        let after = SUBSCRIBE_E2E_LATENCY
+            .with_label_values(&[ns])
+            .get_sample_count();
+        assert_eq!(
+            after,
+            before + 5,
+            "bridge must observe exactly one latency sample per delivered event"
+        );
+        let sum = SUBSCRIBE_E2E_LATENCY
+            .with_label_values(&[ns])
+            .get_sample_sum();
+        assert!(
+            sum > 0.0,
+            "observed latency sum must be strictly positive (got {sum})"
+        );
     }
 }

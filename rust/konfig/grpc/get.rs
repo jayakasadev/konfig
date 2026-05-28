@@ -1,6 +1,7 @@
 //! `Get` and `GetAll` handlers for `KonfigService`.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -9,6 +10,7 @@ use tracing::{debug, warn};
 
 use crate::cache::ConfigCache;
 use crate::grpc::snapshot_to_proto;
+use crate::metrics::GET_DURATION;
 use crate::proto::{Config, GetAllRequest, GetRequest};
 
 pub async fn handle_get(
@@ -16,8 +18,9 @@ pub async fn handle_get(
     req: GetRequest,
 ) -> Result<Response<Config>, Status> {
     debug!(namespace = %req.namespace, name = %req.name, "Get RPC");
+    let started = Instant::now();
 
-    match cache.get(&req.namespace, &req.name) {
+    let result = match cache.get(&req.namespace, &req.name) {
         Some(snap) => Ok(Response::new(snapshot_to_proto(&snap))),
         None => {
             warn!(
@@ -30,7 +33,11 @@ pub async fn handle_get(
                 req.namespace, req.name
             )))
         }
-    }
+    };
+    GET_DURATION
+        .with_label_values(&[&req.namespace])
+        .observe(started.elapsed().as_secs_f64());
+    result
 }
 
 pub async fn handle_get_all(
@@ -38,6 +45,7 @@ pub async fn handle_get_all(
     req: GetAllRequest,
 ) -> Result<Response<ReceiverStream<Result<Config, Status>>>, Status> {
     debug!(namespace = %req.namespace, "GetAll RPC");
+    let started = Instant::now();
 
     let (tx, rx) = mpsc::channel(16);
     let entries = cache.all_in_namespace(&req.namespace);
@@ -48,6 +56,9 @@ pub async fn handle_get_all(
         }
     });
 
+    GET_DURATION
+        .with_label_values(&[&req.namespace])
+        .observe(started.elapsed().as_secs_f64());
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
