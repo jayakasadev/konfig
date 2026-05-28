@@ -40,10 +40,10 @@ jobs:
         run: bazel build //rust/konfig:konfig_bin //tools/konfig-cli:konfig_cli
 
       - name: Test
-        run: bazel test //rust/konfig:test //tools/konfig-cli:... --test_output=errors
+        run: bazel test //rust/konfig:test //tools/konfig-cli/... --test_output=errors
 
       - name: Clippy
-        run: bazel test //rust/konfig:clippy_test //tools/konfig-cli:clippy_test
+        run: bazel build //rust/konfig:clippy_test //tools/konfig-cli:clippy_test
 
   integration-tests:
     name: Integration tests (K3s)
