@@ -88,12 +88,12 @@ pdb:
 # ── Konfig-specific settings ──────────────────────────────────────────────────
 
 konfig:
-  # -- Kubernetes namespace to watch for Config CRDs.
-  # The konfig pod watches this namespace for a Config CRD with the given name.
+  # -- Namespace and name of the seed Config CRD the server watches at startup.
+  # The server uses this to determine readiness (health probe becomes SERVING
+  # only after this resource is found and cached). Set to any Config CRD that
+  # exists in your cluster. Does not limit which configs subscribers can request.
   watchNamespace: "default"
-
-  # -- Name of the Config CRD to watch.
-  watchName: "trading"
+  watchName: "app-config"
 
   # -- Enable ConfigMap watching (opt-in via label konfig.io/managed=true).
   # When true, labeled ConfigMaps are merged into ConfigCache alongside CRDs.
