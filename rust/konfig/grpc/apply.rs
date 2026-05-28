@@ -38,7 +38,6 @@ pub async fn apply_inner(
     yaml_content: &str,
     kube_client: Client,
 ) -> Result<Response<ApplyResponse>, Status> {
-    let started = Instant::now();
     let spec: ConfigSpec = serde_yaml::from_str(yaml_content)
         .map_err(|e| Status::invalid_argument(format!("invalid YAML: {e}")))?;
 
@@ -56,6 +55,7 @@ pub async fn apply_spec(
     spec: ConfigSpec,
     kube_client: Client,
 ) -> Result<Response<ApplyResponse>, Status> {
+    let started = Instant::now();
     let incoming = spec.schema_version;
 
     let ar = config_api_resource();
