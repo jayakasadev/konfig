@@ -1,48 +1,66 @@
-//! Lock-free multi-key Secret cache backed by [`DashMap`].
+//! Lock-free multi-key Secret cache backed by [`ArcSwap`]`<HashMap>`.
 //!
 //! Same pattern as [`ConfigCache`] but typed for [`SecretSnapshot`].
+//! Reads are fully lock-free (atomic pointer load via `arc_swap`).
+//! The 1-2 writers serialise on a `Mutex<()>` that is never held during reads.
 //!
 //! [`ConfigCache`]: crate::cache::ConfigCache
-//! [`DashMap`]: dashmap::DashMap
+//! [`ArcSwap`]: arc_swap::ArcSwap
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
+use arc_swap::ArcSwap;
 
 use crate::types::SecretSnapshot;
 
+type Inner = HashMap<(String, String), Arc<SecretSnapshot>>;
+
 pub struct SecretCache {
-    inner: DashMap<(String, String), Arc<SecretSnapshot>>,
+    inner: ArcSwap<Inner>,
+    /// Serialises the 1-2 concurrent writers — never held during reads.
+    write_lock: Mutex<()>,
 }
 
 impl SecretCache {
     pub fn new() -> Self {
         Self {
-            inner: DashMap::new(),
+            inner: ArcSwap::from_pointee(Inner::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
+    /// Zero locking — atomic pointer load only.
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<SecretSnapshot>> {
         self.inner
-            .get(&(namespace.to_string(), name.to_string()))
-            .map(|v| Arc::clone(&v))
+            .load()
+            .get(&(namespace.to_owned(), name.to_owned()))
+            .cloned()
     }
 
     pub fn update(&self, snap: SecretSnapshot) {
-        let key = (snap.namespace.clone(), snap.name.clone());
-        self.inner.insert(key, Arc::new(snap));
+        let _guard = self.write_lock.lock().unwrap();
+        let current = self.inner.load();
+        let mut next = (**current).clone();
+        next.insert((snap.namespace.clone(), snap.name.clone()), Arc::new(snap));
+        self.inner.store(Arc::new(next));
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.inner
-            .remove(&(namespace.to_string(), name.to_string()));
+        let _guard = self.write_lock.lock().unwrap();
+        let current = self.inner.load();
+        let mut next = (**current).clone();
+        next.remove(&(namespace.to_owned(), name.to_owned()));
+        self.inner.store(Arc::new(next));
     }
 
+    /// Zero locking — atomic pointer load only.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<SecretSnapshot>> {
         self.inner
+            .load()
             .iter()
-            .filter(|e| e.key().0 == namespace)
-            .map(|e| Arc::clone(e.value()))
+            .filter(|(k, _)| k.0 == namespace)
+            .map(|(_, v)| Arc::clone(v))
             .collect()
     }
 }

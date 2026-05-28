@@ -1,24 +1,30 @@
-//! Lock-free multi-key config cache backed by [`DashMap`].
+//! Lock-free multi-key config cache backed by [`ArcSwap`]`<HashMap>`.
 //!
-//! Keyed by `(namespace, name)`.  Phase 2D upgrade from the single-entry
-//! `ArcSwap<ConfigSnapshot>` to support multi-namespace, multi-config deployments.
+//! Keyed by `(namespace, name)`.  Reads are fully lock-free (atomic pointer
+//! load via `arc_swap`).  The 1-2 writers serialise on a `Mutex<()>` that is
+//! never held during reads.
 //!
-//! [`DashMap`]: dashmap::DashMap
+//! [`ArcSwap`]: arc_swap::ArcSwap
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
+use arc_swap::ArcSwap;
 
 use crate::types::ConfigSnapshot;
 
 // ── ConfigCache ───────────────────────────────────────────────────────────────
 
+type Inner = HashMap<(String, String), Arc<ConfigSnapshot>>;
+
 /// Shared, lock-free multi-key cache for [`ConfigSnapshot`].
 ///
-/// Keyed by `(namespace, name)`.  Sharded by DashMap — concurrent reads and
-/// writes do not block across different keys.
+/// Keyed by `(namespace, name)`.  Reads pay only an atomic pointer load;
+/// writes clone the current map, mutate the clone, then swap the pointer.
 pub struct ConfigCache {
-    inner: DashMap<(String, String), Arc<ConfigSnapshot>>,
+    inner: ArcSwap<Inner>,
+    /// Serialises the 1-2 concurrent writers — never held during reads.
+    write_lock: Mutex<()>,
 }
 
 impl ConfigCache {
@@ -29,47 +35,61 @@ impl ConfigCache {
     /// non-empty `namespace` + `name`, it is pre-inserted; otherwise it is
     /// discarded (default snapshots have no key to insert under).
     pub fn new(initial: ConfigSnapshot) -> Self {
-        let map = DashMap::new();
+        let mut map = Inner::new();
         if !initial.namespace.is_empty() && !initial.name.is_empty() {
             let key = (initial.namespace.clone(), initial.name.clone());
             map.insert(key, Arc::new(initial));
         }
-        Self { inner: map }
+        Self {
+            inner: ArcSwap::from_pointee(map),
+            write_lock: Mutex::new(()),
+        }
     }
 
     /// Look up a snapshot by `(namespace, name)`.
     ///
     /// Returns `None` when no entry has been inserted for this key yet.
+    /// Zero locking — atomic pointer load only.
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
         self.inner
-            .get(&(namespace.to_string(), name.to_string()))
-            .map(|v| Arc::clone(&v))
+            .load()
+            .get(&(namespace.to_owned(), name.to_owned()))
+            .cloned()
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
     pub fn update(&self, snap: ConfigSnapshot) {
-        let key = (snap.namespace.clone(), snap.name.clone());
-        self.inner.insert(key, Arc::new(snap));
+        let _guard = self.write_lock.lock().unwrap();
+        let current = self.inner.load();
+        let mut next = (**current).clone();
+        next.insert((snap.namespace.clone(), snap.name.clone()), Arc::new(snap));
+        self.inner.store(Arc::new(next));
     }
 
     /// Remove the entry for `(namespace, name)` if present.
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.inner
-            .remove(&(namespace.to_string(), name.to_string()));
+        let _guard = self.write_lock.lock().unwrap();
+        let current = self.inner.load();
+        let mut next = (**current).clone();
+        next.remove(&(namespace.to_owned(), name.to_owned()));
+        self.inner.store(Arc::new(next));
     }
 
     /// Return all snapshots whose namespace matches `namespace`.
+    /// Zero locking — atomic pointer load only.
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<ConfigSnapshot>> {
         self.inner
+            .load()
             .iter()
-            .filter(|entry| entry.key().0 == namespace)
-            .map(|entry| Arc::clone(entry.value()))
+            .filter(|(k, _)| k.0 == namespace)
+            .map(|(_, v)| Arc::clone(v))
             .collect()
     }
 
     /// Return `true` when the cache contains at least one entry.
+    /// Zero locking — atomic pointer load only.
     pub fn is_populated(&self) -> bool {
-        !self.inner.is_empty()
+        !self.inner.load().is_empty()
     }
 
     /// Mark all cached snapshots as stale (watcher lost K8s connection).
@@ -78,21 +98,22 @@ impl ConfigCache {
     /// `stale_since = Some(now)`.  Next `cache.update(snap)` for a fresh
     /// Apply event will insert a snapshot with `stale_since = None`.
     pub fn mark_all_stale(&self) {
+        let _guard = self.write_lock.lock().unwrap();
+        let current = self.inner.load();
+        let mut next = (**current).clone();
         let now = std::time::Instant::now();
-        let keys: Vec<(String, String)> = self.inner.iter().map(|e| e.key().clone()).collect();
-        for key in keys {
-            if let Some(arc) = self.inner.get(&key) {
-                let mut snap = (**arc).clone();
-                snap.stale_since = Some(now);
-                drop(arc);
-                self.inner.insert(key, Arc::new(snap));
-            }
+        for v in next.values_mut() {
+            let mut snap = (**v).clone();
+            snap.stale_since = Some(now);
+            *v = Arc::new(snap);
         }
+        self.inner.store(Arc::new(next));
     }
 
     /// Return any one snapshot — useful for health-gate checks.
+    /// Zero locking — atomic pointer load only.
     pub fn load_any(&self) -> Option<Arc<ConfigSnapshot>> {
-        self.inner.iter().next().map(|e| Arc::clone(e.value()))
+        self.inner.load().values().next().cloned()
     }
 
     /// Backward-compat helper: returns any cached snapshot.
@@ -214,8 +235,6 @@ mod tests {
         assert!(cache.get("ns", "cfg").unwrap().stale_since.is_none());
     }
 
-    // old_guard_survives_update is dropped since DashMap doesn't give ArcSwap
-    // guard semantics; Arc::clone provides equivalent stability of owned ref.
     #[test]
     fn concurrent_reads_see_consistent_version() {
         use std::sync::Arc;
