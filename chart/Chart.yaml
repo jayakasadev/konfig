@@ -3,11 +3,11 @@ name: konfig
 description: >
   Generic Kubernetes config distribution service.
   Watches Config.konfig.io/v1 CRDs and streams live config changes to consumer
-  pods via gRPC server-streaming (Subscribe RPC) or embedded kube-rs watchers.
+  pods via gRPC server-streaming (Subscribe RPC).
 type: application
 version: 0.1.0
 appVersion: "latest"
-home: https://github.com/CapitalIntent/capitalintent
+home: https://github.com/jayakasadev/konfig
 keywords:
   - config
   - configuration
@@ -15,9 +15,9 @@ keywords:
   - kubernetes
   - operator
 maintainers:
-  - name: CapitalIntent
+  - name: jayakasadev
 sources:
-  - https://github.com/CapitalIntent/capitalintent/tree/main/rust/konfig
+  - https://github.com/jayakasadev/konfig
 annotations:
   artifacthub.io/changes: |
     - kind: added
