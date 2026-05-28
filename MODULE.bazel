@@ -120,7 +120,7 @@ register_toolchains("@konfig_llvm_toolchain//:all", dev_dependency = True)
 # Crate universe — konfig's Rust deps
 # NOT dev_dependency: needed to build @konfig//rust/konfig:konfig targets
 ##################################
-crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate", isolate = True)
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
