@@ -1,6 +1,6 @@
 name: Konfig K8s Integration Tests
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - 'rust/konfig/**'
@@ -10,7 +10,7 @@ on:
       - '.github/workflows/konfig-k8s-integration.yml'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
