@@ -1,0 +1,122 @@
+name: Coverage and Quality
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/konfig/**'
+      - 'proto/konfig/**'
+      - 'tools/konfig-cli/**'
+      - '.github/workflows/coverage.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: Tests, coverage, and CRAP
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      BB_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Install protoc and lcov
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler lcov
+
+      - name: Configure Bazel for CI (BuildBuddy remote cache)
+        run: |
+          cat > .bazelrc.user << EOF
+          common --config=ci
+          common --remote_cache=grpcs://remote.buildbuddy.io
+          common --remote_header=x-buildbuddy-api-key=$BB_API_KEY
+          build --build_metadata=BRANCH_NAME=${{ github.ref_name }}
+          build --build_metadata=COMMIT_SHA=${{ github.sha }}
+          build --build_metadata=REPO_URL=https://github.com/jayakasadev/konfig
+          EOF
+
+      - name: Cache cargo-crap binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-crap
+          key: cargo-crap-0.2.0
+
+      - name: Install cargo-crap
+        run: command -v cargo-crap || cargo install cargo-crap --locked --version 0.2.0
+
+      - name: Run tests with coverage
+        run: bash tools/coverage.sh /tmp/rust_coverage.info
+
+      - name: Convert LCOV for cargo-crap
+        run: python3 tools/bazel_lcov_to_lcov.py /tmp/rust_coverage.info /tmp/rust_coverage_std.info
+
+      - name: CRAP metric gate
+        id: crap
+        continue-on-error: true
+        run: |
+          cargo crap --workspace \
+            --lcov /tmp/rust_coverage_std.info \
+            --format pr-comment \
+            > /tmp/crap_report.md; CRAP_EXIT=$?
+          if [[ ! -s /tmp/crap_report.md ]]; then
+            printf '⚠️ cargo-crap failed to produce a report.\n' > /tmp/crap_report.md
+          fi
+          exit $CRAP_EXIT
+
+      - name: Coverage comment
+        id: coverage_comment
+        continue-on-error: true
+        run: |
+          python3 tools/coverage_pr_comment.py \
+            /tmp/rust_coverage.info \
+            /dev/null \
+            "origin/${{ github.base_ref }}" \
+            --fail-under=0 \
+            --ratchet-tolerance=999 \
+            --output /tmp/coverage_comment.md
+
+      - name: Combine quality reports
+        if: always()
+        run: |
+          {
+            printf '<!-- ci-quality-report -->\n\n'
+            if [[ -s /tmp/crap_report.md ]]; then
+              grep -v '<!-- cargo-crap-report -->' /tmp/crap_report.md || true
+            fi
+            printf '\n---\n\n'
+            if [[ -s /tmp/coverage_comment.md ]]; then
+              grep -v '<!-- coverage-report -->' /tmp/coverage_comment.md || true
+            fi
+          } > /tmp/combined_report.md
+
+      - name: Find existing quality comment
+        if: always()
+        uses: peter-evans/find-comment@v3
+        id: find-quality-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: github-actions[bot]
+          body-includes: "<!-- ci-quality-report -->"
+
+      - name: Post combined quality report
+        if: always()
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.find-quality-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-path: /tmp/combined_report.md
+          edit-mode: replace
+
+      - name: Enforce CRAP threshold
+        if: always() && steps.crap.outcome == 'failure'
+        run: |
+          echo "CRAP violations found — see PR comment for details."
+          exit 1
