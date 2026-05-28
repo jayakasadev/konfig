@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = {version = "4", features = ["derive"]}
-console-subscriber = "0.4"
-dial9-tokio-telemetry = {version = "0.3", features = ["tracing-layer"]}
+console-subscriber = {workspace = true}
+dial9-tokio-telemetry = {workspace = true}
 futures-util = "0.3"
 konfig = {path = "../../rust/konfig"}
 tokio = {workspace = true, features = ["full"]}

@@ -131,7 +131,12 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "konfig_crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = ["//:Cargo.toml"],
+    manifests = [
+        "//:Cargo.toml",
+        "//rust/konfig:Cargo.toml",
+        "//tools/konfig-cli:Cargo.toml",
+        "//tools/konfig-loadtest:Cargo.toml",
+    ],
     supported_platform_triples = [
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-gnu",

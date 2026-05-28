@@ -4,10 +4,12 @@ rust_binary(
     name = "konfig_loadtest",
     srcs = ["src/main.rs"],
     tags = ["konfig", "loadtest", "rust"],
-    visibility = ["//docker/konfig-loadtest:__pkg__"],
+    visibility = ["//visibility:public"],
     deps = [
         "//rust/konfig",
         "@konfig_crates//:clap",
+        "@konfig_crates//:console-subscriber",
+        "@konfig_crates//:dial9-tokio-telemetry",
         "@konfig_crates//:futures-util",
         "@konfig_crates//:tokio",
         "@konfig_crates//:tonic",
