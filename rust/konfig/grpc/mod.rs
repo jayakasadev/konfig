@@ -58,7 +58,9 @@ pub struct KonfigServer {
     /// One broadcast sender per namespace — shared across all Config subscribers
     /// for that namespace.  A single kube watcher drives the sender; each
     /// subscriber gets a `Receiver` clone (O(1) fan-out).
-    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<ConfigEvent>>>,
+    /// Events are wrapped in `Arc` so broadcast clones are reference-count
+    /// increments only — serialisation happens once per apply, not per subscriber.
+    pub(crate) namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<Arc<ConfigEvent>>>>,
     /// Per-namespace replay buffer for the `resume_resource_version` reconnect
     /// path.  Holds the last `REPLAY_BUFFER_SIZE` events so reconnecting clients
     /// can catch up without opening a new kube watch.
