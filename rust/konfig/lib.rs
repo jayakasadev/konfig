@@ -20,6 +20,12 @@ pub mod secret_watcher;
 pub mod types;
 pub mod watcher;
 
+/// Re-export `kube::Client` so consumers that depend on `@konfig//rust/konfig:konfig`
+/// can call `konfig::KubeClient::try_default()` using the same kube crate instance
+/// as the watcher, avoiding a cross-universe type mismatch when passing the client
+/// to `konfig::watcher::Watcher::new()`.
+pub use kube::Client as KubeClient;
+
 // Generated protobuf types (via build.rs + tonic-build).
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/konfig.v1.rs"));
