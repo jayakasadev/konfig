@@ -48,6 +48,7 @@ async fn start_server(cache: Arc<ConfigCache>, kube_client: kube::Client) -> u16
         health_reporter: None,
         secret_namespace_broadcasts: Arc::new(DashMap::new()),
         last_event_at_map: Arc::new(DashMap::new()) as LastEventAtMap,
+        shutdown_signal: None,
     };
 
     tokio::spawn(async move {

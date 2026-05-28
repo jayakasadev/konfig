@@ -110,6 +110,7 @@ rust_test(
     ],
     deps = [
         ":konfig",
+        "@konfig_crates//:dashmap",
         "@konfig_crates//:k8s-openapi",
         "@konfig_crates//:kube",
         "@konfig_crates//:rustls",

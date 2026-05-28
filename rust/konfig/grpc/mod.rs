@@ -2,6 +2,21 @@
 //!
 //! Implements the tonic-generated `KonfigService` trait on `KonfigServer`.
 //! All message types are Protobuf (standard tonic codec, no custom codec).
+//!
+//! # Graceful drain (SIGTERM handling)
+//!
+//! `KonfigServer` carries a `draining: Arc<AtomicBool>` flag.  When set:
+//!   - new `Apply`/`Get`/`GetAll`/`Subscribe`/secret RPCs return `UNAVAILABLE`
+//!     so clients reconnect to a healthy pod via DNS / service mesh.
+//!   - the gRPC health endpoint flips to `NOT_SERVING` so K8s readiness probes
+//!     immediately remove the pod from the Service endpoint list.
+//!   - the per-subscriber drain notifier (`drain_notify`) is triggered so
+//!     existing Subscribe streams close cleanly (server-side `Ok(())`) rather
+//!     than dying mid-stream when the listener is dropped.
+//!
+//! The drain sequence is owned by the caller of `serve`: pass a future to
+//! `ServerConfig::shutdown_signal` that resolves on SIGTERM, and `serve` will
+//! orchestrate the transitions then call `Server::serve_with_shutdown`.
 
 pub mod apply;
 pub mod get;
@@ -10,17 +25,19 @@ pub mod secret_get;
 pub mod subscribe;
 pub mod subscribe_secrets;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use kube::Client;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cache::ConfigCache;
 use crate::grpc::subscribe::{BroadcastFrame, ReplayBuffer, gc_task};
@@ -32,6 +49,10 @@ use crate::proto::{
     konfig_service_server::{KonfigService, KonfigServiceServer},
 };
 use crate::secret_cache::SecretCache;
+
+/// Maximum time we wait for in-flight RPCs to complete after SIGTERM before
+/// forcing the gRPC server to stop accepting connections.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Server config ─────────────────────────────────────────────────────────────
 
@@ -53,7 +74,18 @@ pub struct ServerConfig {
     /// namespace on every event; the background sampler in `serve` reads it
     /// every 5 s and updates the `konfig_stale_seconds` gauge.
     pub last_event_at_map: LastEventAtMap,
+    /// Future that resolves when the process receives SIGTERM (or otherwise
+    /// wants to drain).  When it resolves `serve` flips the draining flag,
+    /// closes active Subscribe streams, marks the health endpoint NOT_SERVING,
+    /// then waits up to `DRAIN_TIMEOUT` before calling `serve_with_shutdown`.
+    ///
+    /// When `None` the server never drains (test/CLI use).
+    pub shutdown_signal: Option<ShutdownSignal>,
 }
+
+/// Type-erased shutdown future.  Boxed so the field doesn't push a generic
+/// parameter onto `ServerConfig`.
+pub type ShutdownSignal = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 // ── KonfigServer ──────────────────────────────────────────────────────────────
 
@@ -79,11 +111,55 @@ pub struct KonfigServer {
     /// Intentionally distinct from `namespace_broadcasts` so Config and Secret
     /// streams do not interfere.
     pub(crate) secret_namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
+    /// `true` once `begin_drain` has been called.  Handlers consult this on
+    /// entry and short-circuit with `UNAVAILABLE` so the LB drops them onto a
+    /// healthy peer.
+    pub(crate) draining: Arc<AtomicBool>,
+    /// `Notify` triggered by `begin_drain`.  Active subscribe streams `await`
+    /// this and exit cleanly (`Ok(())`) when notified.
+    pub(crate) drain_notify: Arc<Notify>,
+}
+
+impl KonfigServer {
+    /// Returns `true` once the server has begun draining (post-SIGTERM).
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Flip the drain flag and wake every active Subscribe stream.  Idempotent
+    /// — repeated calls are a no-op.
+    pub fn begin_drain(&self) {
+        if self
+            .draining
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            info!("Drain begun — closing active subscribers and rejecting new RPCs");
+            self.drain_notify.notify_waiters();
+        }
+    }
+
+    /// Returns a clone of the per-subscriber drain notifier so handlers can
+    /// `notified().await` to detect drain.
+    pub(crate) fn drain_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.drain_notify)
+    }
+}
+
+/// Helper used at the top of each RPC handler — returns an `Err(Status::unavailable)`
+/// when the server is draining so the client reconnects to a healthy pod.
+fn check_drain(draining: &AtomicBool) -> Result<(), Status> {
+    if draining.load(Ordering::SeqCst) {
+        Err(Status::unavailable("server draining"))
+    } else {
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
 impl KonfigService for KonfigServer {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<Config>, Status> {
+        check_drain(&self.draining)?;
         get::handle_get(Arc::clone(&self.cache), request.into_inner()).await
     }
 
@@ -93,6 +169,7 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<GetAllRequest>,
     ) -> Result<Response<Self::GetAllStream>, Status> {
+        check_drain(&self.draining)?;
         get::handle_get_all(Arc::clone(&self.cache), request.into_inner()).await
     }
 
@@ -100,6 +177,7 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<ApplyRequest>,
     ) -> Result<Response<ApplyResponse>, Status> {
+        check_drain(&self.draining)?;
         apply::handle_apply(self.kube_client.clone(), request.into_inner()).await
     }
 
@@ -109,12 +187,14 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        check_drain(&self.draining)?;
         subscribe::handle_subscribe(
             Arc::clone(&self.cache),
             self.kube_client.clone(),
             Arc::clone(&self.namespace_broadcasts),
             Arc::clone(&self.namespace_replay_buffers),
             Arc::clone(&self.watcher_handles),
+            self.drain_notify(),
             request.into_inner(),
         )
         .await
@@ -126,6 +206,7 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<GetSecretRequest>,
     ) -> Result<Response<SecretResponse>, Status> {
+        check_drain(&self.draining)?;
         secret_get::handle_get_secret(Arc::clone(&self.secret_cache), request.into_inner()).await
     }
 
@@ -135,6 +216,7 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<GetAllSecretsRequest>,
     ) -> Result<Response<Self::GetAllSecretsStream>, Status> {
+        check_drain(&self.draining)?;
         secret_get::handle_get_all_secrets(Arc::clone(&self.secret_cache), request.into_inner())
             .await
     }
@@ -143,6 +225,7 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<ApplySecretRequest>,
     ) -> Result<Response<ApplySecretResponse>, Status> {
+        check_drain(&self.draining)?;
         secret_apply::handle_apply_secret(self.kube_client.clone(), request.into_inner()).await
     }
 
@@ -152,9 +235,11 @@ impl KonfigService for KonfigServer {
         &self,
         request: Request<SubscribeSecretsRequest>,
     ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
+        check_drain(&self.draining)?;
         subscribe_secrets::handle_subscribe_secrets(
             self.kube_client.clone(),
             Arc::clone(&self.secret_namespace_broadcasts),
+            self.drain_notify(),
             request.into_inner(),
         )
         .await
@@ -207,6 +292,9 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         });
     }
 
+    let draining = Arc::new(AtomicBool::new(false));
+    let drain_notify = Arc::new(Notify::new());
+
     let server = KonfigServer {
         cache: cfg.cache,
         secret_cache: cfg.secret_cache,
@@ -215,12 +303,52 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         namespace_replay_buffers,
         watcher_handles,
         secret_namespace_broadcasts: cfg.secret_namespace_broadcasts,
+        draining: Arc::clone(&draining),
+        drain_notify: Arc::clone(&drain_notify),
     };
     let svc = KonfigServiceServer::new(server);
 
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
+
+    // Compose the shutdown future that `serve_with_shutdown` waits on.
+    //
+    // When `shutdown_signal` resolves we:
+    //   1. flip the `draining` flag — new RPCs immediately fail UNAVAILABLE
+    //   2. notify all active Subscribe streams so they close cleanly
+    //   3. mark the health endpoint NOT_SERVING (K8s readiness probe fails)
+    //   4. wait up to `DRAIN_TIMEOUT` for in-flight RPCs to finish
+    // The future then resolves and tonic stops accepting new connections.
+    let health_reporter_for_drain = cfg.health_reporter.clone();
+    let shutdown_future = async move {
+        let Some(signal) = cfg.shutdown_signal else {
+            // No shutdown signal supplied — never resolve; tonic runs forever.
+            std::future::pending::<()>().await;
+            return;
+        };
+        signal.await;
+        info!("Shutdown signal received — beginning drain");
+        draining.store(true, Ordering::SeqCst);
+        drain_notify.notify_waiters();
+
+        if let Some(reporter) = health_reporter_for_drain {
+            reporter
+                .set_not_serving::<KonfigServiceServer<KonfigServer>>()
+                .await;
+            info!("Health endpoint: NOT_SERVING");
+        }
+
+        // Give in-flight RPCs DRAIN_TIMEOUT to wind down before tonic stops
+        // accepting connections.  We just sleep — handlers either complete
+        // naturally (Apply, Get) or were notified above (Subscribe).
+        info!(
+            timeout_s = DRAIN_TIMEOUT.as_secs(),
+            "Waiting for in-flight RPCs to drain"
+        );
+        tokio::time::sleep(DRAIN_TIMEOUT).await;
+        warn!("Drain timeout elapsed — forcing server shutdown");
+    };
 
     if let Some(reporter) = cfg.health_reporter {
         let health_svc = tonic_health::pb::health_server::HealthServer::new(
@@ -229,10 +357,13 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         builder
             .add_service(health_svc)
             .add_service(svc)
-            .serve(cfg.addr)
+            .serve_with_shutdown(cfg.addr, shutdown_future)
             .await
     } else {
-        builder.add_service(svc).serve(cfg.addr).await
+        builder
+            .add_service(svc)
+            .serve_with_shutdown(cfg.addr, shutdown_future)
+            .await
     }
 }
 
@@ -251,5 +382,124 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
             .stale_since
             .map(|t| t.elapsed().as_millis() as i64)
             .unwrap_or(-1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_draining` flips after `begin_drain` and the notify wakes waiters.
+    #[tokio::test]
+    async fn begin_drain_flips_flag_and_notifies_waiters() {
+        let server = test_server();
+        assert!(!server.is_draining());
+
+        // Subscribe to the drain notifier *before* triggering — `notify_waiters`
+        // only wakes waiters that are already parked.
+        let notify = server.drain_notify();
+        let waiter = tokio::spawn(async move { notify.notified().await });
+        // Yield once so the waiter actually parks before we notify.
+        tokio::task::yield_now().await;
+
+        server.begin_drain();
+        assert!(server.is_draining());
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s")
+            .expect("task panicked");
+    }
+
+    /// `begin_drain` is idempotent — calling twice does not re-notify.
+    #[tokio::test]
+    async fn begin_drain_is_idempotent() {
+        let server = test_server();
+        server.begin_drain();
+        server.begin_drain();
+        assert!(server.is_draining());
+    }
+
+    /// `check_drain` returns `UNAVAILABLE` once the flag is set.
+    #[test]
+    fn check_drain_returns_unavailable_when_draining() {
+        let flag = AtomicBool::new(false);
+        assert!(check_drain(&flag).is_ok());
+        flag.store(true, Ordering::SeqCst);
+        let err = check_drain(&flag).expect_err("must error when draining");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    /// While draining the `Get` RPC short-circuits with UNAVAILABLE before
+    /// touching the cache — clients reconnect to a healthy pod via DNS / LB.
+    #[tokio::test]
+    async fn draining_get_rpc_returns_unavailable() {
+        let server = test_server();
+        server.begin_drain();
+        let req = Request::new(GetRequest {
+            namespace: "default".into(),
+            name: "any".into(),
+        });
+        let err = server.get(req).await.expect_err("must reject during drain");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    /// While draining the `Apply` RPC short-circuits with UNAVAILABLE before
+    /// hitting the kube API.  The dummy client used in this test has no
+    /// reachable API server — so the only way this passes is if `check_drain`
+    /// fires before the kube call.
+    #[tokio::test]
+    async fn draining_apply_rpc_returns_unavailable() {
+        let server = test_server();
+        server.begin_drain();
+        let req = Request::new(ApplyRequest {
+            namespace: "default".into(),
+            name: "cfg".into(),
+            yaml_content: "schema_version: 1\n".into(),
+        });
+        let err = server
+            .apply(req)
+            .await
+            .expect_err("must reject during drain");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    /// While draining the `Subscribe` RPC short-circuits with UNAVAILABLE so
+    /// new clients are bounced onto a healthy peer.
+    #[tokio::test]
+    async fn draining_subscribe_rpc_returns_unavailable() {
+        let server = test_server();
+        server.begin_drain();
+        let req = Request::new(SubscribeRequest {
+            namespace: "default".into(),
+            names: Vec::new(),
+            resume_resource_version: String::new(),
+        });
+        let err = server
+            .subscribe(req)
+            .await
+            .expect_err("must reject new subscribers during drain");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    fn test_server() -> KonfigServer {
+        KonfigServer {
+            cache: Arc::new(ConfigCache::new(crate::types::ConfigSnapshot::default())),
+            secret_cache: Arc::new(SecretCache::new()),
+            kube_client: dummy_client(),
+            namespace_broadcasts: Arc::new(DashMap::new()),
+            namespace_replay_buffers: Arc::new(DashMap::new()),
+            watcher_handles: Arc::new(DashMap::new()),
+            secret_namespace_broadcasts: Arc::new(DashMap::new()),
+            draining: Arc::new(AtomicBool::new(false)),
+            drain_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Build a `kube::Client` from the in-tree default config.  Never actually
+    /// connects — the tests above only touch the drain plumbing.
+    fn dummy_client() -> kube::Client {
+        let cfg = kube::Config::new("http://127.0.0.1:0".parse().expect("valid URL"));
+        kube::Client::try_from(cfg).expect("infallible — only constructs HTTP client")
     }
 }

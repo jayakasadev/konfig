@@ -9,7 +9,9 @@
 //! 6. Wait until cache has at least one populated entry
 //! 7. Register gRPC health as SERVING
 //! 8. Start /metrics HTTP server (port 9090) in background
-//! 9. Start gRPC server (port 50051) — blocks until SIGTERM/shutdown
+//! 9. Install SIGTERM / Ctrl-C handler — feeds the shutdown signal that
+//!    `grpc::serve` consumes to begin graceful drain
+//! 10. Start gRPC server (port 50051) — blocks until shutdown completes
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,7 +19,8 @@ use std::sync::Arc;
 use clap::Parser;
 use dashmap::DashMap;
 use kube::Client;
-use tokio::sync::broadcast;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{broadcast, oneshot};
 use tracing::info;
 
 use konfig::cache::ConfigCache;
@@ -141,7 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serve_metrics(metrics_addr).await;
     });
 
-    // gRPC server (blocks until shutdown).
+    // Install SIGTERM + Ctrl-C handlers.  Either signal triggers a single
+    // `oneshot` send into the gRPC server's shutdown channel.  `serve` then
+    // flips the drain flag, closes active Subscribe streams, marks the health
+    // endpoint NOT_SERVING, and waits up to DRAIN_TIMEOUT before stopping.
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = tokio::signal::ctrl_c() => info!("Received Ctrl-C (SIGINT)"),
+        }
+        // `send` returns Err only if the receiver was already dropped — fine.
+        let _ = shutdown_tx.send(());
+    });
+
+    // gRPC server (blocks until shutdown completes).
     info!(addr = %args.grpc_addr, "starting gRPC server");
     serve(ServerConfig {
         addr: args.grpc_addr,
@@ -151,9 +169,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_reporter: Some(health_reporter),
         secret_namespace_broadcasts,
         last_event_at_map,
+        shutdown_signal: Some(Box::pin(async move {
+            // Resolve when the signal handler fires.  If `shutdown_tx` was
+            // dropped (signal task panicked) treat that as a drain request
+            // too — better than hanging forever.
+            let _ = shutdown_rx.await;
+        })),
     })
     .await?;
 
+    info!("gRPC server stopped cleanly");
     Ok(())
 }
 
