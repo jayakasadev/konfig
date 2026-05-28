@@ -39,8 +39,9 @@ struct Args {
     #[arg(long, env = "KONFIG_NAMESPACE", default_value = "default")]
     namespace: String,
 
-    /// Config CRD name to watch
-    #[arg(long, env = "KONFIG_NAME", default_value = "trading")]
+    /// Config CRD name to watch.
+    /// KONFIG_NAME must be set — no default config name; konfig is domain-agnostic.
+    #[arg(long, env = "KONFIG_NAME")]
     name: String,
 }
 
@@ -73,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Health reporter: NOT_SERVING until cache is populated.
     let (health_reporter, _health_server) = tonic_health::server::health_reporter();
-    health_reporter.set_not_serving::<KonfigServiceServer<konfig::grpc::KonfigServer>>().await;
+    health_reporter
+        .set_not_serving::<KonfigServiceServer<konfig::grpc::KonfigServer>>()
+        .await;
 
     // Wait for cache to be populated (at least one entry).
     {
@@ -117,9 +120,13 @@ async fn serve_metrics(addr: SocketAddr) {
     use axum::{Router, routing::get};
 
     let app = Router::new().route("/metrics", get(metrics_handler));
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind metrics");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind metrics");
     info!(addr = %addr, "metrics server starting");
-    axum::serve(listener, app).await.expect("metrics server error");
+    axum::serve(listener, app)
+        .await
+        .expect("metrics server error");
 }
 
 async fn metrics_handler() -> String {
@@ -127,6 +134,8 @@ async fn metrics_handler() -> String {
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buf = Vec::new();
-    encoder.encode(&metric_families, &mut buf).unwrap_or_default();
+    encoder
+        .encode(&metric_families, &mut buf)
+        .unwrap_or_default();
     String::from_utf8(buf).unwrap_or_default()
 }

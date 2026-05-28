@@ -62,7 +62,10 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
 
     let data = cm.data.as_ref()?;
 
-    let schema_version: u32 = data.get("schema_version").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let schema_version: u32 = data
+        .get("schema_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     // If data["content"] key exists, parse it as JSON/YAML.
     // Otherwise treat the entire data map (minus schema_version) as content.

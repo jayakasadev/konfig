@@ -124,7 +124,9 @@ impl KonfigService for KonfigServer {
         &self,
         _request: Request<SubscribeSecretsRequest>,
     ) -> Result<Response<Self::SubscribeSecretsStream>, Status> {
-        Err(Status::unimplemented("SubscribeSecrets not yet implemented"))
+        Err(Status::unimplemented(
+            "SubscribeSecrets not yet implemented",
+        ))
     }
 }
 
@@ -147,7 +149,11 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
         let health_svc = tonic_health::pb::health_server::HealthServer::new(
             tonic_health::server::HealthService::from_health_reporter(reporter),
         );
-        builder.add_service(health_svc).add_service(svc).serve(cfg.addr).await
+        builder
+            .add_service(health_svc)
+            .add_service(svc)
+            .serve(cfg.addr)
+            .await
     } else {
         builder.add_service(svc).serve(cfg.addr).await
     }

@@ -29,7 +29,10 @@ pub async fn import_configmap(
 
     let data = cm.data.unwrap_or_default();
 
-    let schema_version: u32 = data.get("schema_version").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let schema_version: u32 = data
+        .get("schema_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
     // Convert string map to JSON object, excluding schema_version (promoted to top level).
     let mut content = serde_json::Map::new();
@@ -64,7 +67,9 @@ pub async fn import_configmap(
     let api: Api<kube::core::DynamicObject> = Api::namespaced_with(client, namespace, &ar);
 
     let pp = PatchParams::apply("konfig.v1").force();
-    let patched = api.patch(target_name, &pp, &Patch::Apply(patch_body)).await?;
+    let patched = api
+        .patch(target_name, &pp, &Patch::Apply(patch_body))
+        .await?;
 
     let rv = patched.metadata.resource_version.unwrap_or_default();
 
@@ -84,5 +89,7 @@ pub async fn import_configmap(
         );
     }
 
-    Ok(ImportResult { resource_version: rv })
+    Ok(ImportResult {
+        resource_version: rv,
+    })
 }

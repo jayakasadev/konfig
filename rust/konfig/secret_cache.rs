@@ -17,11 +17,15 @@ pub struct SecretCache {
 
 impl SecretCache {
     pub fn new() -> Self {
-        Self { inner: DashMap::new() }
+        Self {
+            inner: DashMap::new(),
+        }
     }
 
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<SecretSnapshot>> {
-        self.inner.get(&(namespace.to_string(), name.to_string())).map(|v| Arc::clone(&v))
+        self.inner
+            .get(&(namespace.to_string(), name.to_string()))
+            .map(|v| Arc::clone(&v))
     }
 
     pub fn update(&self, snap: SecretSnapshot) {
@@ -30,7 +34,8 @@ impl SecretCache {
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        self.inner.remove(&(namespace.to_string(), name.to_string()));
+        self.inner
+            .remove(&(namespace.to_string(), name.to_string()));
     }
 
     pub fn all_in_namespace(&self, namespace: &str) -> Vec<Arc<SecretSnapshot>> {

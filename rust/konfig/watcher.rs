@@ -84,8 +84,8 @@ impl Watcher {
         loop {
             let api: Api<DynamicObject> =
                 Api::namespaced_with(self.client.clone(), &namespace, &ar);
-            let wc = kube_watcher::Config::default()
-                .fields(&format!("metadata.name={config_name}"));
+            let wc =
+                kube_watcher::Config::default().fields(&format!("metadata.name={config_name}"));
             let mut stream = kube_watch_stream(api, wc).boxed();
 
             info!(
@@ -152,7 +152,12 @@ pub fn parse_config_object(obj: &DynamicObject) -> Option<ConfigSnapshot> {
         .map_err(|e| warn!(name = %name, "Failed to parse Config spec: {e}"))
         .ok()?;
 
-    Some(ConfigSnapshot::from_spec(name, namespace, spec, resource_version))
+    Some(ConfigSnapshot::from_spec(
+        name,
+        namespace,
+        spec,
+        resource_version,
+    ))
 }
 
 #[cfg(test)]
