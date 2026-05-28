@@ -29,11 +29,7 @@ rust_library(
         ],
     ),
     tags = ["konfig", "rust"],
-    visibility = [
-        "//rust/coinbase:__subpackages__",
-        "//rust/kraken:__subpackages__",
-        "//tools:__subpackages__",
-    ],
+    visibility = ["//visibility:public"],
     deps = [
         ":konfig_bs",
         "@konfig_crates//:arc-swap",
@@ -62,13 +58,13 @@ rust_library(
     proc_macro_deps = ["@konfig_crates//:async-trait"],
 )
 
-# Server binary — built by docker/konfig:image via //rust/konfig:konfig_bin.
+# Server binary — standalone konfig server entry point.
 # Direct crate deps required: standard rust_binary does not inherit library deps.
 rust_binary(
     name = "konfig_bin",
     srcs = ["main.rs"],
     tags = ["konfig", "rust"],
-    visibility = ["//docker/konfig:__pkg__"],
+    visibility = ["//visibility:public"],
     deps = [
         ":konfig",
         "@konfig_crates//:axum",
