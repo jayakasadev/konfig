@@ -96,7 +96,6 @@ rust_test(
         "tests/%s.rs" % name,
         "tests/common/mod.rs",
     ],
-    crate = ":konfig",
     crate_features = ["integration"],
     env = {
         "RUST_LOG": "konfig=debug,kube=info",
@@ -109,6 +108,7 @@ rust_test(
         "rust",
     ],
     deps = [
+        ":konfig",
         "@konfig_crates//:k8s-openapi",
         "@konfig_crates//:kube",
         "@konfig_crates//:rustls",
