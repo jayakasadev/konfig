@@ -1,4 +1,4 @@
-//! konfig-loadtest — 4-scenario gRPC stress test for Konfig.
+//! konfig-loadtest — 5-scenario gRPC stress test for Konfig.
 //!
 //! Profiling stack:
 //!   tracing                — structured spans/events
@@ -8,12 +8,21 @@
 //!   2. get_flood        — 50 concurrent tasks × 100 Get RPCs, p99 < 50ms
 //!   3. reconnect_storm  — 50 subscribers disconnected + resumed with RV
 //!   4. secrets_flood    — 20 ApplySecret + 50 SubscribeSecrets streams, p99 < 500ms
+//!   5. backpressure     — 50 normal + 5 stalled (1 s/rx) subscribers; observes
+//!      replay-buffer high-water + UNAVAILABLE rate + drops.
+//!
+//! Sustained mode:
+//!   --duration N        — when set, scenario_subscribe_flood loops applies for
+//!      N seconds (no per-event accounting, drain-only check). Designed for
+//!      steady-state RSS / allocator decay runs.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use futures_util::StreamExt as _;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{Barrier, Mutex};
 use tonic::transport::Channel;
 use tracing::{error, info, warn};
@@ -37,9 +46,15 @@ struct Args {
     config_name: String,
     #[arg(long, default_value = "my-config-secret")]
     secret_name: String,
-    /// Which scenario to run: all | subscribe | get | reconnect | secrets
+    /// Which scenario to run: all | subscribe | get | reconnect | secrets | backpressure
     #[arg(long, default_value = "all")]
     scenario: String,
+    /// Sustained run duration in seconds. When set, scenario_subscribe_flood
+    /// loops the apply phase until the deadline elapses (skips per-event
+    /// accounting; drain-only success check). Intended for steady-state RSS
+    /// and allocator-decay observation, not a CI gate.
+    #[arg(long)]
+    duration: Option<u64>,
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -127,6 +142,107 @@ async fn connect(addr: &str) -> Result<Channel, tonic::transport::Error> {
         .await
 }
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Resolve the seed schema_version (current + 1) for a config so applies start
+/// strictly above any pre-existing state. Returns 1 when the resource is
+/// missing or unreadable.
+async fn seed_start_seq(addr: &str, namespace: &str, config_name: &str) -> Result<u32, String> {
+    let ch = connect(addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let mut client = KonfigServiceClient::new(ch);
+    let seq = match client
+        .get(tonic::Request::new(GetRequest {
+            namespace: namespace.to_owned(),
+            name: config_name.to_owned(),
+        }))
+        .await
+    {
+        Ok(r) => r.into_inner().schema_version + 1,
+        Err(_) => 1,
+    };
+    Ok(seq)
+}
+
+/// Drive `start_seq..=end_seq` apply RPCs at `interval_ms` cadence on a single
+/// connection. Returns (ok, err) counts. Connection errors are fatal and
+/// returned as `Err`.
+async fn drive_applies(
+    addr: &str,
+    namespace: &str,
+    config_name: &str,
+    start_seq: u32,
+    end_seq: u32,
+    interval_ms: u64,
+    scenario_label: &str,
+) -> Result<(u32, u32), String> {
+    let ch = connect(addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let mut driver = KonfigServiceClient::new(ch);
+    let mut ok: u32 = 0;
+    let mut err: u32 = 0;
+    for seq in start_seq..=end_seq {
+        let yaml = format!(
+            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: {scenario_label}\n"
+        );
+        match driver
+            .apply(tonic::Request::new(ApplyRequest {
+                namespace: namespace.to_owned(),
+                name: config_name.to_owned(),
+                yaml_content: yaml,
+            }))
+            .await
+        {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                err += 1;
+                warn!(seq, "{scenario_label}: Apply failed: {e}");
+            }
+        }
+        if seq < end_seq {
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+    }
+    Ok((ok, err))
+}
+
+/// Background task that polls `/metrics` and tracks the
+/// `konfig_replay_buffer_depth{namespace=...}` high-water mark. Stops when the
+/// `stop_rx` watch flips to `true`. Returns (high_water, sample_count, errors).
+fn spawn_replay_buffer_poller(
+    metrics_url: Option<String>,
+    namespace: String,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<(u64, u64, u64)> {
+    tokio::spawn(async move {
+        let mut high_water: u64 = 0;
+        let mut samples: u64 = 0;
+        let mut errors: u64 = 0;
+        let Some(url) = metrics_url else {
+            return (high_water, samples, errors);
+        };
+        loop {
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow() { break; }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(S5_METRICS_POLL_MS)) => {
+                    match fetch_replay_buffer_depth(&url, &namespace).await {
+                        Ok(depth) => {
+                            samples += 1;
+                            if depth > high_water { high_water = depth; }
+                        }
+                        Err(_) => errors += 1,
+                    }
+                }
+            }
+        }
+        (high_water, samples, errors)
+    })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -147,6 +263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config_name = %args.config_name,
         secret_name = %args.secret_name,
         scenario = %args.scenario,
+        duration_s = ?args.duration,
         "konfig-loadtest starting"
     );
 
@@ -155,8 +272,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if run_all || args.scenario == "subscribe" {
         info!("=== Scenario 1: Subscribe flood + rapid apply ===");
-        results
-            .push(scenario_subscribe_flood(&args.addr, &args.namespace, &args.config_name).await);
+        results.push(
+            scenario_subscribe_flood(
+                &args.addr,
+                &args.namespace,
+                &args.config_name,
+                args.duration,
+            )
+            .await,
+        );
     }
 
     if run_all || args.scenario == "get" {
@@ -173,6 +297,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if run_all || args.scenario == "secrets" {
         info!("=== Scenario 4: SubscribeSecrets flood ===");
         results.push(scenario_secrets_flood(&args.addr, &args.namespace, &args.secret_name).await);
+    }
+
+    // Backpressure is opt-in: not part of `all` because the slow-subscriber
+    // sleep skews the wall-clock budget of the CI gate (~30 s vs 60 s overall).
+    if args.scenario == "backpressure" {
+        info!("=== Scenario 5: Slow-subscriber backpressure ===");
+        results.push(scenario_backpressure(&args.addr, &args.namespace, &args.config_name).await);
     }
 
     // ── Summary table ─────────────────────────────────────────────────────────
@@ -202,24 +333,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 // ── Scenario 1: Subscribe flood + rapid apply ─────────────────────────────────
 
-const S1_SUBSCRIBERS: usize = 100;
-const S1_APPLIES: u32 = 200;
-const S1_INTERVAL_MS: u64 = 100;
 const S1_DRAIN_SECS: u64 = 30;
 const S1_P99_LIMIT_MS: u128 = 500;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
 
 async fn scenario_subscribe_flood(
     addr: &str,
     namespace: &str,
     config_name: &str,
+    duration_secs: Option<u64>,
 ) -> ScenarioResult {
+    // S1 knobs — env overrides let the CI gate and the stress profile share
+    // one binary. Defaults preserve the historical 100×200×100 ms shape.
+    let s1_subscribers: usize = env_usize("S1_SUBSCRIBERS", 100);
+    let s1_applies: u32 = env_u32("S1_APPLIES", 200);
+    let s1_interval_ms: u64 = env_u64("S1_INTERVAL_MS", 100);
+
+    if let Some(secs) = duration_secs {
+        return scenario_subscribe_flood_sustained(
+            addr,
+            namespace,
+            config_name,
+            s1_subscribers,
+            s1_interval_ms,
+            secs,
+        )
+        .await;
+    }
+
     // Shared state.
     let latencies: Arc<Mutex<Stats>> = Arc::new(Mutex::new(Stats::new()));
-    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S1_SUBSCRIBERS]));
+    let event_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; s1_subscribers]));
     let apply_timestamps: Arc<Mutex<Vec<Option<Instant>>>> =
-        Arc::new(Mutex::new(vec![None; S1_APPLIES as usize]));
+        Arc::new(Mutex::new(vec![None; s1_applies as usize]));
     let successful_applies: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let barrier = Arc::new(Barrier::new(S1_SUBSCRIBERS + 1));
+    let barrier = Arc::new(Barrier::new(s1_subscribers + 1));
 
     // Seed: get current schema_version to start above it.
     let start_seq = {
@@ -244,11 +410,10 @@ async fn scenario_subscribe_flood(
             Err(_) => 1,
         }
     };
-    let end_seq = start_seq + S1_APPLIES - 1;
+    let end_seq = start_seq + s1_applies - 1;
 
-    // Spawn 100 subscribers.
-    let mut sub_handles = Vec::with_capacity(S1_SUBSCRIBERS);
-    for sub_id in 0..S1_SUBSCRIBERS {
+    let mut sub_handles = Vec::with_capacity(s1_subscribers);
+    for sub_id in 0..s1_subscribers {
         let h = tokio::spawn(s1_subscriber(
             sub_id,
             addr.to_owned(),
@@ -267,7 +432,7 @@ async fn scenario_subscribe_flood(
     barrier.wait().await;
     info!(
         "S1: all {} subscribers connected — starting apply loop ({}ms interval)",
-        S1_SUBSCRIBERS, S1_INTERVAL_MS
+        s1_subscribers, s1_interval_ms
     );
 
     // Apply loop: 200 applies at 100 ms intervals.
@@ -302,15 +467,15 @@ async fn scenario_subscribe_flood(
             Err(e) => warn!(seq, "S1: Apply failed: {e}"),
         }
         if seq < end_seq {
-            tokio::time::sleep(Duration::from_millis(S1_INTERVAL_MS)).await;
+            tokio::time::sleep(Duration::from_millis(s1_interval_ms)).await;
         }
     }
 
     let n_ok = *successful_applies.lock().await;
-    let total_expected = S1_SUBSCRIBERS as u32 * n_ok;
+    let total_expected = s1_subscribers as u32 * n_ok;
     info!(
         "S1: apply loop done ({n_ok}/{} succeeded) — draining",
-        S1_APPLIES
+        s1_applies
     );
 
     // Drain with timeout.
@@ -369,6 +534,227 @@ async fn scenario_subscribe_flood(
         ScenarioResult::pass("subscribe_flood")
     } else {
         ScenarioResult::fail("subscribe_flood", failures)
+    }
+}
+
+// ── Scenario 1 (sustained): drain-only check over wall-clock window ───────────
+//
+// Per-event apply-timestamp accounting is intentionally skipped — over a
+// 10-min run at 25k events/s the timestamp vector and the latency histogram
+// would themselves leak the loadtest process. The success criterion is "the
+// system kept up": applies returned Ok and at the end the broadcast queues
+// drain. Steady-state RSS / allocator decay must be observed externally
+// (Prometheus, pprof, `ps` slope) — that is the point of the sustained mode.
+
+const S1_SUSTAINED_DRAIN_SECS: u64 = 60;
+
+async fn scenario_subscribe_flood_sustained(
+    addr: &str,
+    namespace: &str,
+    config_name: &str,
+    s1_subscribers: usize,
+    s1_interval_ms: u64,
+    duration_secs: u64,
+) -> ScenarioResult {
+    let event_counts: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![0u64; s1_subscribers]));
+    let barrier = Arc::new(Barrier::new(s1_subscribers + 1));
+
+    // Seed: get current schema_version to start above it.
+    let start_seq = {
+        let ch = match connect(addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                return ScenarioResult::fail(
+                    "subscribe_flood_sustained",
+                    vec![format!("connect failed: {e}")],
+                );
+            }
+        };
+        let mut client = KonfigServiceClient::new(ch);
+        match client
+            .get(tonic::Request::new(GetRequest {
+                namespace: namespace.to_owned(),
+                name: config_name.to_owned(),
+            }))
+            .await
+        {
+            Ok(r) => r.into_inner().schema_version + 1,
+            Err(_) => 1,
+        }
+    };
+
+    // Spawn subscribers — they just count, no latency capture.
+    let mut sub_handles = Vec::with_capacity(s1_subscribers);
+    for sub_id in 0..s1_subscribers {
+        let h = tokio::spawn(s1_subscriber_sustained(
+            sub_id,
+            addr.to_owned(),
+            namespace.to_owned(),
+            config_name.to_owned(),
+            start_seq,
+            Arc::clone(&event_counts),
+            Arc::clone(&barrier),
+        ));
+        sub_handles.push(h);
+    }
+    barrier.wait().await;
+    info!(
+        "S1 sustained: {} subscribers connected — applying for {} s ({}ms interval)",
+        s1_subscribers, duration_secs, s1_interval_ms
+    );
+
+    // Apply loop until deadline.
+    let ch = match connect(addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            for h in sub_handles {
+                h.abort();
+            }
+            return ScenarioResult::fail(
+                "subscribe_flood_sustained",
+                vec![format!("connect failed: {e}")],
+            );
+        }
+    };
+    let mut driver = KonfigServiceClient::new(ch);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
+    let mut seq = start_seq;
+    let mut n_ok: u64 = 0;
+    let mut n_err: u64 = 0;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let yaml = format!(
+            "schema_version: {seq}\ncontent:\n  iteration: {seq}\n  scenario: subscribe_flood_sustained\n"
+        );
+        match driver
+            .apply(tonic::Request::new(ApplyRequest {
+                namespace: namespace.to_owned(),
+                name: config_name.to_owned(),
+                yaml_content: yaml,
+            }))
+            .await
+        {
+            Ok(_) => n_ok += 1,
+            Err(e) => {
+                n_err += 1;
+                warn!(seq, "S1 sustained: Apply failed: {e}");
+            }
+        }
+        seq = seq.wrapping_add(1);
+        tokio::time::sleep(Duration::from_millis(s1_interval_ms)).await;
+    }
+
+    let total_expected = (s1_subscribers as u64) * n_ok;
+    info!(
+        n_ok,
+        n_err, total_expected, "S1 sustained: apply loop done — draining"
+    );
+
+    // Drain.
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(S1_SUSTAINED_DRAIN_SECS);
+    let drained;
+    loop {
+        let received: u64 = event_counts.lock().await.iter().sum();
+        if received >= total_expected {
+            info!("S1 sustained: all {total_expected} events drained");
+            drained = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= drain_deadline {
+            warn!(
+                received,
+                total_expected, "S1 sustained: drain timeout — broadcast may have lagged"
+            );
+            drained = false;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for h in sub_handles {
+        h.abort();
+    }
+
+    let received_final: u64 = event_counts.lock().await.iter().sum();
+    info!(
+        applies_ok = n_ok,
+        applies_err = n_err,
+        subscribers = s1_subscribers,
+        total_expected,
+        total_received = received_final,
+        "S1 sustained results"
+    );
+
+    // Sustained mode is a soak: success is "applies returned Ok and queues
+    // drained". p99 / per-event miss accounting is not asserted because the
+    // observation target is external (RSS slope, allocator decay).
+    let mut failures = Vec::new();
+    if n_ok == 0 {
+        failures.push("zero successful applies".into());
+    }
+    if !drained {
+        failures.push(format!("drain timeout: {received_final}/{total_expected}"));
+    }
+    if failures.is_empty() {
+        ScenarioResult::pass("subscribe_flood_sustained")
+    } else {
+        ScenarioResult::fail("subscribe_flood_sustained", failures)
+    }
+}
+
+async fn s1_subscriber_sustained(
+    sub_id: usize,
+    addr: String,
+    namespace: String,
+    config_name: String,
+    start_seq: u32,
+    event_counts: Arc<Mutex<Vec<u64>>>,
+    barrier: Arc<Barrier>,
+) {
+    let ch = match connect(&addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(sub_id, "S1 sustained: connect failed: {e}");
+            barrier.wait().await;
+            return;
+        }
+    };
+    let mut client = KonfigServiceClient::new(ch);
+    let stream = match client
+        .subscribe(tonic::Request::new(SubscribeRequest {
+            namespace: namespace.clone(),
+            names: vec![config_name.clone()],
+            resume_resource_version: String::new(),
+        }))
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            warn!(sub_id, "S1 sustained: subscribe failed: {e}");
+            barrier.wait().await;
+            return;
+        }
+    };
+    barrier.wait().await;
+
+    let mut stream = stream;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => {
+                let version = event.config.as_ref().map(|c| c.schema_version).unwrap_or(0);
+                if version < start_seq {
+                    continue;
+                }
+                event_counts.lock().await[sub_id] += 1;
+            }
+            Err(e) => {
+                warn!(sub_id, "S1 sustained: stream error: {e}");
+                break;
+            }
+        }
     }
 }
 
@@ -1059,4 +1445,327 @@ async fn s4_subscriber(
             }
         }
     }
+}
+
+// ── Scenario 5: Slow-subscriber backpressure ──────────────────────────────────
+//
+// Goal: observe konfig's behavior when a fraction of subscribers cannot keep
+// up with the broadcast rate. The broadcast channel has a finite capacity
+// (`tokio::sync::broadcast`) so stalled receivers either:
+//   - cause `RecvError::Lagged` on their stream (server drops them →
+//     server-side warn + the client sees UNAVAILABLE / stream end),
+//   - or back-pressure the broadcast send (delaying normal subs).
+//
+// We measure:
+//   - replay-buffer high-water mark via konfig `/metrics`
+//     (`konfig_replay_buffer_depth{namespace=...}`) — sampled every 200 ms.
+//   - UNAVAILABLE / stream-error rate on the slow subs.
+//   - missed events on the NORMAL subs (the population we actually care about).
+//
+// Hard accept: missed > 0 on normal subs is the failure signal. Stalled subs
+// missing events is the expected behavior under backpressure.
+
+const S5_NORMAL_SUBS: usize = 50;
+const S5_SLOW_SUBS: usize = 5;
+const S5_SLOW_RX_SLEEP_MS: u64 = 1000;
+const S5_DRAIN_SECS: u64 = 60;
+const S5_METRICS_POLL_MS: u64 = 200;
+
+async fn scenario_backpressure(addr: &str, namespace: &str, config_name: &str) -> ScenarioResult {
+    let s5_applies: u32 = env_u32("S1_APPLIES", 200);
+    let s5_interval_ms: u64 = env_u64("S1_INTERVAL_MS", 100);
+    // Derive metrics endpoint from the gRPC addr: same host, port 9090.
+    // Falls back to None if the addr can't be parsed; in that case we record
+    // "high-water not measured" in the report.
+    let metrics_url = derive_metrics_url(addr);
+
+    let normal_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S5_NORMAL_SUBS]));
+    let slow_counts: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(vec![0u32; S5_SLOW_SUBS]));
+    let slow_errors: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let slow_unavailable: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let normal_errors: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let barrier = Arc::new(Barrier::new(S5_NORMAL_SUBS + S5_SLOW_SUBS + 1));
+
+    // Seed.
+    let start_seq = match seed_start_seq(addr, namespace, config_name).await {
+        Ok(seq) => seq,
+        Err(msg) => return ScenarioResult::fail("backpressure", vec![msg]),
+    };
+    let end_seq = start_seq + s5_applies - 1;
+
+    // Spawn 50 normal subs.
+    let mut normal_handles = Vec::with_capacity(S5_NORMAL_SUBS);
+    for sub_id in 0..S5_NORMAL_SUBS {
+        let h = tokio::spawn(s5_subscriber(
+            sub_id,
+            addr.to_owned(),
+            namespace.to_owned(),
+            config_name.to_owned(),
+            start_seq,
+            None, // normal subs: no rx sleep
+            Arc::clone(&normal_counts),
+            Arc::clone(&normal_errors),
+            Arc::clone(&barrier),
+            None,
+        ));
+        normal_handles.push(h);
+    }
+
+    // Spawn 5 slow subs.
+    let mut slow_handles = Vec::with_capacity(S5_SLOW_SUBS);
+    for sub_id in 0..S5_SLOW_SUBS {
+        let h = tokio::spawn(s5_subscriber(
+            sub_id,
+            addr.to_owned(),
+            namespace.to_owned(),
+            config_name.to_owned(),
+            start_seq,
+            Some(S5_SLOW_RX_SLEEP_MS),
+            Arc::clone(&slow_counts),
+            Arc::clone(&slow_errors),
+            Arc::clone(&barrier),
+            Some(Arc::clone(&slow_unavailable)),
+        ));
+        slow_handles.push(h);
+    }
+
+    barrier.wait().await;
+    info!(
+        "S5: {} normal + {} slow subs connected — applying {} at {} ms interval",
+        S5_NORMAL_SUBS, S5_SLOW_SUBS, s5_applies, s5_interval_ms
+    );
+
+    // Spawn metrics poller — samples replay-buffer depth every 200 ms.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let poller = spawn_replay_buffer_poller(metrics_url.clone(), namespace.to_owned(), stop_rx);
+
+    // Apply driver.
+    let (n_applies_ok, n_applies_err) = match drive_applies(
+        addr,
+        namespace,
+        config_name,
+        start_seq,
+        end_seq,
+        s5_interval_ms,
+        "backpressure",
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(e) => {
+            let _ = stop_tx.send(true);
+            for h in normal_handles.into_iter().chain(slow_handles) {
+                h.abort();
+            }
+            return ScenarioResult::fail("backpressure", vec![e]);
+        }
+    };
+
+    let total_expected = S5_NORMAL_SUBS as u32 * n_applies_ok;
+    info!(
+        "S5: apply loop done ({n_applies_ok}/{} OK, {n_applies_err} err) — draining normal subs",
+        s5_applies
+    );
+
+    // Drain — only require NORMAL subs to catch up. Slow subs are expected
+    // to lag or be dropped.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(S5_DRAIN_SECS);
+    loop {
+        let received: u32 = normal_counts.lock().await.iter().sum();
+        if received >= total_expected {
+            info!("S5: all {total_expected} events drained on normal subs");
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(received, total_expected, "S5: drain timeout on normal subs");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = stop_tx.send(true);
+    for h in normal_handles.into_iter().chain(slow_handles) {
+        h.abort();
+    }
+    let (high_water, hw_samples, hw_errors) = poller.await.unwrap_or((0, 0, 0));
+
+    let normal_received: u32 = normal_counts.lock().await.iter().sum();
+    let slow_received: u32 = slow_counts.lock().await.iter().sum();
+    let normal_missed = total_expected.saturating_sub(normal_received);
+    let slow_err = *slow_errors.lock().await;
+    let slow_unavail = *slow_unavailable.lock().await;
+    let normal_err = *normal_errors.lock().await;
+    let slow_expected = S5_SLOW_SUBS as u32 * n_applies_ok;
+    let slow_missed = slow_expected.saturating_sub(slow_received);
+
+    let high_water_repr = if metrics_url.is_none() {
+        "n/a (no metrics endpoint derived from addr)".to_owned()
+    } else if hw_samples == 0 {
+        format!("n/a ({hw_errors} fetch errors)")
+    } else {
+        format!("{high_water} (samples={hw_samples}, errors={hw_errors})")
+    };
+
+    info!(
+        normal_subs = S5_NORMAL_SUBS,
+        slow_subs = S5_SLOW_SUBS,
+        applies_ok = n_applies_ok,
+        applies_err = n_applies_err,
+        normal_received,
+        normal_missed,
+        normal_stream_errors = normal_err,
+        slow_received,
+        slow_missed,
+        slow_stream_errors = slow_err,
+        slow_unavailable = slow_unavail,
+        replay_buffer_high_water = %high_water_repr,
+        "S5 results"
+    );
+
+    // Acceptance:
+    //   - normal subs must not miss events (broadcast capacity should
+    //     absorb a 5/55 stalled fraction over a 20 s run).
+    //   - apply RPCs must not error.
+    //   - konfig must not crash (loadtest can't see crash directly —
+    //     surfaces as connect-fail or zero applies).
+    let mut failures = Vec::new();
+    if n_applies_ok == 0 {
+        failures.push("zero successful applies".into());
+    }
+    if normal_missed > 0 {
+        failures.push(format!(
+            "{normal_missed} missed events on normal subscribers"
+        ));
+    }
+    if failures.is_empty() {
+        ScenarioResult::pass("backpressure")
+    } else {
+        ScenarioResult::fail("backpressure", failures)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn s5_subscriber(
+    sub_id: usize,
+    addr: String,
+    namespace: String,
+    config_name: String,
+    start_seq: u32,
+    rx_sleep_ms: Option<u64>,
+    event_counts: Arc<Mutex<Vec<u32>>>,
+    stream_errors: Arc<Mutex<u64>>,
+    barrier: Arc<Barrier>,
+    unavailable_counter: Option<Arc<Mutex<u64>>>,
+) {
+    let ch = match connect(&addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                sub_id,
+                slow = rx_sleep_ms.is_some(),
+                "S5: connect failed: {e}"
+            );
+            barrier.wait().await;
+            return;
+        }
+    };
+    let mut client = KonfigServiceClient::new(ch);
+    let stream = match client
+        .subscribe(tonic::Request::new(SubscribeRequest {
+            namespace: namespace.clone(),
+            names: vec![config_name.clone()],
+            resume_resource_version: String::new(),
+        }))
+        .await
+    {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            warn!(sub_id, "S5: subscribe failed: {e}");
+            *stream_errors.lock().await += 1;
+            barrier.wait().await;
+            return;
+        }
+    };
+    barrier.wait().await;
+
+    let mut stream = stream;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(event) => {
+                let version = event.config.as_ref().map(|c| c.schema_version).unwrap_or(0);
+                if version < start_seq {
+                    continue;
+                }
+                event_counts.lock().await[sub_id] += 1;
+                if let Some(ms) = rx_sleep_ms {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+            }
+            Err(status) => {
+                let code = status.code();
+                if code == tonic::Code::Unavailable
+                    && let Some(c) = &unavailable_counter
+                {
+                    *c.lock().await += 1;
+                }
+                warn!(sub_id, code = ?code, "S5: stream error: {status}");
+                *stream_errors.lock().await += 1;
+                break;
+            }
+        }
+    }
+}
+
+/// Derive `http://<host>:9090/metrics` from a gRPC addr like
+/// `http://127.0.0.1:50051`. Returns None if the addr can't be parsed —
+/// caller treats that as "high-water not measured".
+fn derive_metrics_url(grpc_addr: &str) -> Option<String> {
+    // Strip scheme.
+    let rest = grpc_addr
+        .strip_prefix("http://")
+        .or_else(|| grpc_addr.strip_prefix("https://"))
+        .unwrap_or(grpc_addr);
+    // Cut at the first ':' or '/' to extract host.
+    let host_end = rest.find([':', '/']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("http://{host}:9090/metrics"))
+}
+
+/// Fetch konfig `/metrics`, parse `konfig_replay_buffer_depth{namespace="..."}`,
+/// return the gauge value as a u64.
+async fn fetch_replay_buffer_depth(
+    metrics_url: &str,
+    namespace: &str,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    // Manual HTTP/1.1 GET — keeps the dep surface to tokio. The endpoint is
+    // a small text body so we don't need a real HTTP client here.
+    let host_port = metrics_url
+        .strip_prefix("http://")
+        .ok_or("metrics url must be http://")?;
+    let host_port = host_port
+        .split('/')
+        .next()
+        .ok_or("metrics url missing host")?;
+    let mut stream =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(host_port)).await??;
+    let req = format!("GET /metrics HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = Vec::with_capacity(8192);
+    tokio::time::timeout(Duration::from_millis(500), stream.read_to_end(&mut buf)).await??;
+    let body = std::str::from_utf8(&buf)?;
+    // Find the line: konfig_replay_buffer_depth{namespace="<ns>"} <value>
+    let needle = format!("konfig_replay_buffer_depth{{namespace=\"{namespace}\"}}");
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix(&needle) {
+            let val = rest.trim();
+            // Gauge text format is a float; replay buffer depth is an integer
+            // count, so truncate.
+            let f: f64 = val.parse()?;
+            return Ok(f as u64);
+        }
+    }
+    Err("konfig_replay_buffer_depth not found in /metrics".into())
 }
