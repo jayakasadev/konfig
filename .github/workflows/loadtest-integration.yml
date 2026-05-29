@@ -97,21 +97,29 @@ jobs:
         run: |
           kubectl apply -f infra/konfig-loadtest/seed-config.yaml
 
-      - name: Apply konfig Deployment (override image tag to locally-loaded :latest)
-        # deployment.yaml references kasa288/konfig:main (the prod tag).
-        # The oci_load target tags the locally-built image :latest, so we
-        # rewrite the tag and force IfNotPresent to keep kind from trying
-        # to pull from Docker Hub.
+      - name: Apply konfig Deployment (force IfNotPresent for locally-loaded image)
+        # `infra/konfig/deployment.yaml` now references `kasa288/konfig:latest`
+        # (post-PR-#31 sha-pinning rewrites this to a short SHA on main pushes,
+        # but on PR branches we apply with the `:latest` tag that
+        # `kind load docker-image` placed in the cluster). The default
+        # imagePullPolicy for the `:latest` tag is `Always`, which would force
+        # a Docker Hub pull and fail — patch to `IfNotPresent` so the locally
+        # loaded image is used.
         run: |
           kubectl apply -f infra/konfig/deployment.yaml
-          kubectl set image -n konfig-system deploy/konfig konfig=kasa288/konfig:latest
           kubectl patch -n konfig-system deploy/konfig --type=json -p='[
             {"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}
           ]'
 
-      - name: Wait for konfig rollout
+      - name: Wait for konfig Deployment + Pod Ready (cache populated)
+        # `Available` alone is insufficient because konfig's gRPC health stays
+        # NOT_SERVING until the Config-cache populator observes the watched
+        # CR at least once. Wait on the underlying Pod's `Ready` condition,
+        # which only flips true after readinessProbe (gRPC health) passes.
         run: |
           kubectl rollout status -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Available -n konfig-system deploy/konfig --timeout=180s
+          kubectl wait --for=condition=Ready -n konfig-system pod -l app=konfig --timeout=180s
 
       - name: Apply konfig-loadtest Job (rewrite imagePullPolicy → IfNotPresent)
         # Job pod templates are immutable after creation, so we rewrite the
@@ -122,24 +130,33 @@ jobs:
             infra/konfig-loadtest/job.yaml | kubectl apply -f -
 
       - name: Stream loadtest logs and wait for completion
+        # `kubectl logs -f job/...` tracks the underlying Pod automatically
+        # and waits for it to be Ready before streaming — no race with
+        # ContainerCreating. We first explicitly wait for the Pod's Ready
+        # condition (or initialized for fast-exiting containers) so logs
+        # are available, then stream.
         run: |
-          # Wait for the pod to be created (Job → Pod controller).
+          # Wait for the loadtest pod to be created and have started its
+          # container (initialized + at least scheduled). `--for=condition=Ready`
+          # would block until the pod is Ready, but a fast-exiting Job pod
+          # may never hit Ready — use `jsonpath` instead so we proceed as
+          # soon as the container is running OR has terminated.
           for i in $(seq 1 60); do
-            POD=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
-                    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-            if [ -n "$POD" ]; then break; fi
+            PHASE=$(kubectl get pods -n konfig-system -l job-name=konfig-loadtest \
+                      -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ] || [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ]; then
+              break
+            fi
             sleep 2
           done
-          if [ -z "$POD" ]; then
-            echo "loadtest pod did not appear within 120s"
-            kubectl get pods -n konfig-system
-            exit 1
-          fi
-          echo "Tailing logs from $POD (blocks until pod terminates)"
-          # `kubectl logs -f` exits when the pod completes — its exit code is
-          # not the pod's exit code, so we check Job status afterwards.
-          kubectl logs -n konfig-system -f "$POD" || true
-          # Pod has terminated — check the Job's success/fail status.
+          echo "loadtest pod phase: ${PHASE:-unknown}"
+          # `kubectl logs -f job/...` follows the underlying pod's logs and
+          # exits when the pod terminates. Exit code reflects log-stream
+          # errors, not the pod's exit code — Job status is checked below.
+          kubectl logs -n konfig-system -f job/konfig-loadtest --all-containers=true || true
+          # Pod has terminated — give the Job controller a moment to settle
+          # status, then check succeeded/failed counts.
+          sleep 5
           for i in $(seq 1 30); do
             SUCCEEDED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
             FAILED=$(kubectl get job/konfig-loadtest -n konfig-system -o jsonpath='{.status.failed}' 2>/dev/null || true)
@@ -166,7 +183,11 @@ jobs:
           kubectl describe -n konfig-system deploy/konfig || true
           echo "=== konfig pod logs ==="
           kubectl logs -n konfig-system -l app=konfig --tail=200 || true
-          echo "=== loadtest pod describe ==="
+          echo "=== loadtest job describe ==="
           kubectl describe -n konfig-system job/konfig-loadtest || true
+          echo "=== loadtest pod describe ==="
+          kubectl describe -n konfig-system pod -l job-name=konfig-loadtest || true
+          echo "=== loadtest pod logs (full) ==="
+          kubectl logs -n konfig-system -l job-name=konfig-loadtest --tail=-1 || true
           echo "=== events ==="
           kubectl get events -n konfig-system --sort-by=.lastTimestamp || true
