@@ -75,15 +75,15 @@ bazel_dep(name = "protobuf", version = "29.3")
 bazel_dep(name = "rules_shell", version = "0.3.0")
 
 ##################################
-# linux/arm64 sysroot for cross-compilation from macOS
-# Extracted from ubuntu:22.04 via Docker (runs once, cached by Bazel).
+# Linux sysroots for cross-compilation from macOS
+# Extracted from ubuntu:22.04 via Docker (runs once per arch, cached by Bazel).
 ##################################
 sysroot_ext = use_extension(
     "//tools/sysroot:extensions.bzl",
     "sysroot_ext",
     dev_dependency = True,
 )
-use_repo(sysroot_ext, "linux_arm64_sysroot")
+use_repo(sysroot_ext, "linux_amd64_sysroot", "linux_arm64_sysroot")
 
 ##################################
 # OCI images (dev only — used for building/pushing the server image)
@@ -139,6 +139,11 @@ llvm.sysroot(
     name = "konfig_llvm_toolchain",
     label = "@linux_arm64_sysroot//:sysroot",
     targets = ["linux-aarch64"],
+)
+llvm.sysroot(
+    name = "konfig_llvm_toolchain",
+    label = "@linux_amd64_sysroot//:sysroot",
+    targets = ["linux-x86_64"],
 )
 use_repo(llvm, "konfig_llvm_toolchain", "konfig_llvm_toolchain_llvm")
 register_toolchains("@konfig_llvm_toolchain//:all", dev_dependency = True)

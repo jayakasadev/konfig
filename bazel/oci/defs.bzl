@@ -1,47 +1,52 @@
 """Shared macro for konfig container images.
 
-`konfig_oci_image` wraps the same pipeline that each `docker/<name>/BUILD.bazel`
-used to repeat by hand: cross-compile binary → rename into a layer (0755 perms)
-→ `oci_image` on distroless/cc/arm64 → load + push (sha + latest tags).
+`konfig_oci_image` packages a Rust binary into a multi-arch OCI image:
+per-arch oci_image (linux/amd64 + linux/arm64) -> oci_image_index ->
+load + push (sha + latest tags).
 
-Keeps the three image packages (`konfig`, `konfig-cli`, `konfig-loadtest`) in
-lock-step so a single edit here propagates to all of them.
+Each per-arch image runs the binary through `platform_transition_binary`,
+which flips the platform AND release-config rustc flags (compilation_mode=
+opt, -Cstrip=symbols, -Cpanic=abort). The host-config tools (bsd_tar,
+oci_load runner) stay on the host platform.
+
+Keeps the three image packages (`konfig`, `konfig-cli`, `konfig-loadtest`)
+in lock-step so a single edit here propagates to all of them.
 """
 
 load("@aspect_bazel_lib//lib:expand_template.bzl", "expand_template")
-load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load", "oci_push")
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_image_index", "oci_load", "oci_push")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_attributes", "pkg_files", "strip_prefix")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("//bazel/oci:transitions.bzl", "platform_transition_binary")
 
-def konfig_oci_image(
-        name,
-        binary,
-        binary_name,
-        repository,
-        exposed_ports = None,
+# Supported (arch, platform_label, distroless base) tuples. amd64 first
+# so the load target tags amd64 on `--platform linux/amd64` hosts; docker
+# load picks the matching arch automatically from the index.
+_ARCHES = [
+    struct(
+        arch = "amd64",
+        platform = "//platforms:linux_amd64",
+        base = "@distroless_cc_linux_amd64",
+    ),
+    struct(
+        arch = "arm64",
         platform = "//platforms:linux_arm64",
-        base = "@distroless_cc_linux_arm64_v8"):
-    """Build/load/push a Konfig container image.
+        base = "@distroless_cc_linux_arm64_v8",
+    ),
+]
 
-    Args:
-      name: package-unique prefix; produces `:image`, `:load`, `:push`.
-      binary: label of a rust_binary to package (host-platform target).
-      binary_name: filename written into / inside the image (also the entrypoint).
-      repository: Docker Hub repository (e.g. "kasa288/konfig").
-      exposed_ports: optional list like ["50051/tcp", "9090/tcp"].
-      platform: target platform label; defaults to linux/arm64.
-      base: oci_image base; defaults to distroless/cc linux-arm64.
-    """
-    transitioned = "_{}_bin_transitioned".format(name)
-    files_target = "_{}_files".format(name)
-    layer_target = "_{}_layer".format(name)
-    tags_target = "_{}_remote_tags".format(name)
+def _per_arch_image(name, arch_cfg, binary, binary_name, exposed_ports):
+    """Build a single-arch oci_image and return its label."""
+    suffix = arch_cfg.arch
+    transitioned = "_{}_bin_{}_transitioned".format(name, suffix)
+    files_target = "_{}_files_{}".format(name, suffix)
+    layer_target = "_{}_layer_{}".format(name, suffix)
+    image_target = "_{}_image_{}".format(name, suffix)
 
     platform_transition_binary(
         name = transitioned,
         binary = binary,
-        platform = platform,
+        platform = arch_cfg.platform,
     )
 
     pkg_files(
@@ -59,19 +64,52 @@ def konfig_oci_image(
     )
 
     oci_image(
-        name = "image",
-        base = base,
+        name = image_target,
+        base = arch_cfg.base,
         entrypoint = ["/" + binary_name],
         exposed_ports = exposed_ports or [],
         tars = [":" + layer_target],
     )
 
+    return ":" + image_target
+
+def konfig_oci_image(
+        name,
+        binary,
+        binary_name,
+        repository,
+        exposed_ports = None):
+    """Build/load/push a multi-arch Konfig container image.
+
+    Args:
+      name: package-unique prefix; produces `:image`, `:load`, `:push`.
+      binary: label of a rust_binary to package.
+      binary_name: filename written into / inside the image (also the entrypoint).
+      repository: Docker Hub repository (e.g. "kasa288/konfig").
+      exposed_ports: optional list like ["50051/tcp", "9090/tcp"].
+    """
+    per_arch_labels = [
+        _per_arch_image(name, arch_cfg, binary, binary_name, exposed_ports)
+        for arch_cfg in _ARCHES
+    ]
+
+    oci_image_index(
+        name = "image",
+        images = per_arch_labels,
+    )
+
+    # `:load` loads one arch into the local docker daemon — docker without
+    # the containerd image store cannot accept an OCI image index, so we
+    # tag the arm64 image (the dev host) for the load path. `:push` uses
+    # the full index for both arches in the remote.
+    local_image_label = "_{}_image_arm64".format(name)
+
     # Stamped tag list: short git SHA + "latest". The literal "0000000" gets
-    # substituted with STABLE_GIT_SHA only when `bazel run --stamp` is used; the
-    # placeholder keeps non-stamped builds deterministic and cacheable.
+    # substituted with STABLE_GIT_SHA only when `bazel run --stamp` is used;
+    # the placeholder keeps non-stamped builds deterministic and cacheable.
     expand_template(
-        name = tags_target,
-        out = "_{}_remote_tags.txt".format(name),
+        name = "_remote_tags",
+        out = "_remote_tags.txt",
         stamp_substitutions = {"0000000": "{{STABLE_GIT_SHA}}"},
         template = [
             "0000000",
@@ -81,13 +119,13 @@ def konfig_oci_image(
 
     oci_load(
         name = "load",
-        image = ":image",
+        image = ":" + local_image_label,
         repo_tags = ["{}:latest".format(repository)],
     )
 
     oci_push(
         name = "push",
         image = ":image",
-        remote_tags = ":" + tags_target,
+        remote_tags = ":_remote_tags",
         repository = repository,
     )
