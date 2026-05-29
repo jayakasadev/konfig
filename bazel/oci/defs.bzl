@@ -6,11 +6,12 @@ load + push (sha + latest tags).
 
 Each per-arch image runs the binary through `platform_transition_binary`,
 which flips the platform AND release-config rustc flags (compilation_mode=
-opt, -Cstrip=symbols, -Cpanic=abort). The host-config tools (bsd_tar,
+opt, -Cstrip=debuginfo, -Cpanic=abort). The host-config tools (bsd_tar,
 oci_load runner) stay on the host platform.
 
-Keeps the three image packages (`konfig`, `konfig-cli`, `konfig-loadtest`)
-in lock-step so a single edit here propagates to all of them.
+Keeps the image packages (`konfig`, `konfig-profiling`, `konfig-cli`,
+`konfig-loadtest`) in lock-step so a single edit here propagates to all
+of them.
 """
 
 load("@aspect_bazel_lib//lib:expand_template.bzl", "expand_template")

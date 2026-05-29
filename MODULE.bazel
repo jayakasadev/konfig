@@ -175,4 +175,19 @@ crate.from_cargo(
         "x86_64-unknown-linux-gnu",
     ],
 )
+
+# pyroscope + pyroscope_pprofrs are optional deps of the `konfig` crate, only
+# pulled in by the `profiling` cargo feature (used by `:konfig_bin_profiling`
+# and the `konfig-profiling` image). `cargo tree` without `--features` skips
+# optional deps, so crate_universe wouldn't generate @konfig_crates targets
+# for them off the lockfile alone. Listing them here as `crate.spec` forces
+# the generation; the actual crate version is still pinned by Cargo.lock.
+crate.spec(
+    package = "pyroscope",
+    version = "0.5",
+)
+crate.spec(
+    package = "pyroscope_pprofrs",
+    version = "0.2",
+)
 use_repo(crate, "konfig_crates")
