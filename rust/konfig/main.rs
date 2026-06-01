@@ -25,7 +25,7 @@ use tracing::info;
 
 use konfig::cache::ConfigCache;
 use konfig::grpc::{ServerConfig, serve};
-use konfig::metrics::{LastEventAtMap, last_event_at_for};
+use konfig::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
 use konfig::secret_cache::SecretCache;
 use konfig::secret_watcher::SecretWatcher;
@@ -69,13 +69,34 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("konfig=info".parse()?),
-        )
-        .init();
+    // tokio-console: only installed when both compiled in (`--features tokio_console`)
+    // AND `RUST_CONSOLE=1` at runtime. `console_subscriber::init()` installs its
+    // own tracing layer, so skip the plain fmt subscriber on that path.
+    #[cfg(feature = "tokio_console")]
+    let console_enabled = matches!(std::env::var("RUST_CONSOLE").as_deref(), Ok("1"));
+    #[cfg(not(feature = "tokio_console"))]
+    let console_enabled = false;
+
+    if console_enabled {
+        #[cfg(feature = "tokio_console")]
+        {
+            console_subscriber::init();
+            info!("tokio-console subscriber installed (RUST_CONSOLE=1)");
+        }
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("konfig=info".parse()?),
+            )
+            .init();
+    }
 
     let args = Args::parse();
+
+    // Spawn tokio runtime-metrics sampler — publishes `tokio_*` gauges every
+    // 5 s on the same `/metrics` endpoint as the Prometheus app metrics.
+    spawn_tokio_runtime_sampler(tokio::runtime::Handle::current());
 
     // Pyroscope agent — only compiled into the `konfig-profiling` image
     // variant (`--features profiling`).  Started if PYROSCOPE_SERVER_ADDRESS

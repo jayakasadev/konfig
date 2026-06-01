@@ -49,6 +49,7 @@ rust_library(
         "@konfig_crates//:serde_yaml",
         "@konfig_crates//:thiserror",
         "@konfig_crates//:tokio",
+        "@konfig_crates//:tokio-metrics",
         "@konfig_crates//:tokio-stream",
         "@konfig_crates//:tonic",
         "@konfig_crates//:tonic-health",

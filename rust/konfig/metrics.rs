@@ -9,8 +9,9 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use prometheus::{
-    Counter, CounterVec, GaugeVec, Histogram, HistogramVec, register_counter, register_counter_vec,
-    register_gauge_vec, register_histogram, register_histogram_vec,
+    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, IntGauge, register_counter,
+    register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_histogram_vec, register_int_gauge,
 };
 
 /// Latency buckets for Apply and Get RPC handlers, in seconds.
@@ -193,6 +194,157 @@ lazy_static::lazy_static! {
         H2_FRAME_BYTE_BUCKETS.to_vec()
     )
     .expect("failed to register konfig_h2_data_frame_bytes");
+
+    // ── Tokio runtime metrics (sampled every 5 s by `spawn_tokio_runtime_sampler`) ──
+    // All counters from `tokio_metrics::RuntimeMetrics` are surfaced as
+    // gauges of last-interval values; durations are emitted in seconds.
+
+    pub static ref TOKIO_WORKERS_COUNT: IntGauge = register_int_gauge!(
+        "tokio_workers_count",
+        "Number of worker threads in the tokio runtime"
+    ).expect("register tokio_workers_count");
+
+    pub static ref TOKIO_PARK_COUNT_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_park_count_total",
+        "Total park count summed across all workers in the last interval"
+    ).expect("register tokio_park_count_total");
+
+    pub static ref TOKIO_NOOP_COUNT_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_noop_count_total",
+        "Total noop count (parks that found no work) in the last interval"
+    ).expect("register tokio_noop_count_total");
+
+    pub static ref TOKIO_STEAL_COUNT_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_steal_count_total",
+        "Total tasks stolen across all workers in the last interval"
+    ).expect("register tokio_steal_count_total");
+
+    pub static ref TOKIO_STEAL_OPERATIONS_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_steal_operations_total",
+        "Total steal operations across all workers in the last interval"
+    ).expect("register tokio_steal_operations_total");
+
+    pub static ref TOKIO_REMOTE_SCHEDULES_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_remote_schedules_total",
+        "Tasks scheduled remotely (off-runtime) in the last interval"
+    ).expect("register tokio_remote_schedules_total");
+
+    pub static ref TOKIO_LOCAL_SCHEDULES_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_local_schedules_total",
+        "Tasks scheduled on the local worker queue in the last interval"
+    ).expect("register tokio_local_schedules_total");
+
+    pub static ref TOKIO_OVERFLOW_COUNT_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_overflow_count_total",
+        "Times the local worker queue overflowed into the global queue"
+    ).expect("register tokio_overflow_count_total");
+
+    pub static ref TOKIO_POLLS_COUNT_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_polls_count_total",
+        "Total task polls across all workers in the last interval"
+    ).expect("register tokio_polls_count_total");
+
+    pub static ref TOKIO_BUSY_DURATION_TOTAL: Gauge = register_gauge!(
+        "tokio_busy_duration_total",
+        "Total worker busy duration in seconds (summed across workers) in the last interval"
+    ).expect("register tokio_busy_duration_total");
+
+    pub static ref TOKIO_BUSY_RATIO: Gauge = register_gauge!(
+        "tokio_busy_ratio",
+        "Fraction of worker time spent busy (0.0–1.0) in the last interval"
+    ).expect("register tokio_busy_ratio");
+
+    pub static ref TOKIO_MEAN_POLLS_PER_PARK: Gauge = register_gauge!(
+        "tokio_mean_polls_per_park",
+        "Mean polls processed per worker park in the last interval"
+    ).expect("register tokio_mean_polls_per_park");
+
+    pub static ref TOKIO_MEAN_POLL_DURATION_SECONDS: Gauge = register_gauge!(
+        "tokio_mean_poll_duration_seconds",
+        "Mean task poll duration across all workers (seconds) in the last interval"
+    ).expect("register tokio_mean_poll_duration_seconds");
+
+    pub static ref TOKIO_LOCAL_QUEUE_DEPTH_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_local_queue_depth_total",
+        "Sum of per-worker local queue depths at sample time"
+    ).expect("register tokio_local_queue_depth_total");
+
+    pub static ref TOKIO_GLOBAL_QUEUE_DEPTH: IntGauge = register_int_gauge!(
+        "tokio_global_queue_depth",
+        "Global injection queue depth at sample time"
+    ).expect("register tokio_global_queue_depth");
+
+    pub static ref TOKIO_BLOCKING_QUEUE_DEPTH: IntGauge = register_int_gauge!(
+        "tokio_blocking_queue_depth",
+        "Pending tasks in the blocking-thread queue at sample time"
+    ).expect("register tokio_blocking_queue_depth");
+
+    pub static ref TOKIO_BLOCKING_THREADS_COUNT: IntGauge = register_int_gauge!(
+        "tokio_blocking_threads_count",
+        "Number of live blocking-pool threads at sample time"
+    ).expect("register tokio_blocking_threads_count");
+
+    pub static ref TOKIO_IDLE_BLOCKING_THREADS_COUNT: IntGauge = register_int_gauge!(
+        "tokio_idle_blocking_threads_count",
+        "Number of idle blocking-pool threads at sample time"
+    ).expect("register tokio_idle_blocking_threads_count");
+
+    pub static ref TOKIO_LIVE_TASKS_COUNT: IntGauge = register_int_gauge!(
+        "tokio_live_tasks_count",
+        "Number of live tasks tracked by the tokio runtime at sample time"
+    ).expect("register tokio_live_tasks_count");
+
+    pub static ref TOKIO_BUDGET_FORCED_YIELDS_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_budget_forced_yields_total",
+        "Times a task was forced to yield by the cooperative scheduling budget"
+    ).expect("register tokio_budget_forced_yields_total");
+
+    pub static ref TOKIO_IO_DRIVER_READY_TOTAL: IntGauge = register_int_gauge!(
+        "tokio_io_driver_ready_total",
+        "I/O driver readiness events processed in the last interval"
+    ).expect("register tokio_io_driver_ready_total");
+}
+
+/// Spawn the background tokio runtime-metrics sampler.
+///
+/// Pulls one `RuntimeMetrics` snapshot every 5 s from `RuntimeMonitor::intervals()`
+/// and republishes it as Prometheus gauges (see the `TOKIO_*` statics above).
+///
+/// The sampler task itself is bounded by the iterator tick rate, so steady-state
+/// overhead is one allocation-free `next()` + ~20 gauge writes every 5 s.
+pub fn spawn_tokio_runtime_sampler(handle: tokio::runtime::Handle) {
+    let monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+    tokio::spawn(async move {
+        let mut intervals = monitor.intervals();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            // `intervals()` is an infinite iterator; `next()` deltas against
+            // the previous sample so each gauge reflects last-5s activity.
+            let Some(m) = intervals.next() else { break };
+            TOKIO_WORKERS_COUNT.set(m.workers_count as i64);
+            TOKIO_PARK_COUNT_TOTAL.set(m.total_park_count as i64);
+            TOKIO_NOOP_COUNT_TOTAL.set(m.total_noop_count as i64);
+            TOKIO_STEAL_COUNT_TOTAL.set(m.total_steal_count as i64);
+            TOKIO_STEAL_OPERATIONS_TOTAL.set(m.total_steal_operations as i64);
+            TOKIO_REMOTE_SCHEDULES_TOTAL.set(m.num_remote_schedules as i64);
+            TOKIO_LOCAL_SCHEDULES_TOTAL.set(m.total_local_schedule_count as i64);
+            TOKIO_OVERFLOW_COUNT_TOTAL.set(m.total_overflow_count as i64);
+            TOKIO_POLLS_COUNT_TOTAL.set(m.total_polls_count as i64);
+            TOKIO_BUSY_DURATION_TOTAL.set(m.total_busy_duration.as_secs_f64());
+            TOKIO_BUSY_RATIO.set(m.busy_ratio());
+            TOKIO_MEAN_POLLS_PER_PARK.set(m.mean_polls_per_park());
+            TOKIO_MEAN_POLL_DURATION_SECONDS.set(m.mean_poll_duration.as_secs_f64());
+            TOKIO_LOCAL_QUEUE_DEPTH_TOTAL.set(m.total_local_queue_depth as i64);
+            TOKIO_GLOBAL_QUEUE_DEPTH.set(m.global_queue_depth as i64);
+            TOKIO_BLOCKING_QUEUE_DEPTH.set(m.blocking_queue_depth as i64);
+            TOKIO_BLOCKING_THREADS_COUNT.set(m.blocking_threads_count as i64);
+            TOKIO_IDLE_BLOCKING_THREADS_COUNT.set(m.idle_blocking_threads_count as i64);
+            TOKIO_LIVE_TASKS_COUNT.set(m.live_tasks_count as i64);
+            TOKIO_BUDGET_FORCED_YIELDS_TOTAL.set(m.budget_forced_yield_count as i64);
+            TOKIO_IO_DRIVER_READY_TOTAL.set(m.io_driver_ready_count as i64);
+        }
+    });
 }
 
 /// RAII guard that decrements `ACTIVE_SUBSCRIBERS` for `namespace` on drop.
@@ -519,6 +671,53 @@ mod tests {
                 "metric {required} missing from default registry — /metrics endpoint will not expose it"
             );
         }
+    }
+
+    #[test]
+    fn tokio_runtime_gauges_are_registered() {
+        // Touching each gauge registers it in the default Prometheus registry;
+        // gather() must then surface the metric name.  Cheaper than a full
+        // sampler run and avoids needing a multi-thread runtime in the test.
+        TOKIO_WORKERS_COUNT.set(0);
+        TOKIO_PARK_COUNT_TOTAL.set(0);
+        TOKIO_BLOCKING_QUEUE_DEPTH.set(0);
+        TOKIO_BUSY_DURATION_TOTAL.set(0.0);
+        TOKIO_LOCAL_QUEUE_DEPTH_TOTAL.set(0);
+
+        let families = prometheus::gather();
+        let names: std::collections::HashSet<_> =
+            families.iter().map(|f| f.name().to_string()).collect();
+        for required in [
+            "tokio_workers_count",
+            "tokio_park_count_total",
+            "tokio_blocking_queue_depth",
+            "tokio_busy_duration_total",
+            "tokio_local_queue_depth_total",
+        ] {
+            assert!(
+                names.contains(required),
+                "missing required tokio runtime gauge: {required}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokio_runtime_sampler_publishes_metrics() {
+        // End-to-end check: the sampler must read RuntimeMonitor::intervals()
+        // and publish tokio_workers_count > 0 on a real multi-thread runtime.
+        spawn_tokio_runtime_sampler(tokio::runtime::Handle::current());
+        // `interval` fires immediately on its first tick (Tokio default), so
+        // poll briefly to let the spawned task be scheduled.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if TOKIO_WORKERS_COUNT.get() > 0 {
+                break;
+            }
+        }
+        assert!(
+            TOKIO_WORKERS_COUNT.get() > 0,
+            "sampler should publish tokio_workers_count > 0 on a multi-thread runtime"
+        );
     }
 
     /// Simulates one tick of the `konfig_stale_seconds` sampler loop in
