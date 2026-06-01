@@ -212,6 +212,40 @@ crate.spec(
     version = "0.2",
 )
 
+# console-subscriber is an optional dep of the `konfig` crate behind the
+# `tokio_console` feature. Same pattern as pyroscope above — listed here so
+# crate_universe materialises a Bazel target even when no rust_binary opts
+# into the feature by default.
+crate.spec(
+    package = "console-subscriber",
+    version = "0.4",
+)
+
+# tokio + tokio-metrics + console-subscriber expose their full APIs (per-worker
+# counters, park counts, blocking pool depth, tracing instrumentation) only
+# behind `--cfg tokio_unstable`. The .bazelrc's global `extra_rustc_flags`
+# does NOT propagate to crate_universe-generated targets, so set it per crate
+# here. Tokio's `tokio_unstable`-gated APIs use its `tracing` dep, so the
+# `tracing` feature is enabled on the konfig-crate dep declaration too.
+crate.annotation(
+    crate = "tokio",
+    rustc_flags = ["--cfg=tokio_unstable"],
+    # Tokio declares its `tracing` dependency under
+    # [target."cfg(tokio_unstable)".dependencies.tracing], so `cargo metadata`
+    # (which crate_universe uses to compute the dep graph) does NOT see it
+    # without the cfg. Adding it as an extra dep here so the cfg-gated tokio
+    # code paths that import `tracing::Span` link correctly.
+    deps = ["@konfig_crates//:tracing"],
+)
+crate.annotation(
+    crate = "tokio-metrics",
+    rustc_flags = ["--cfg=tokio_unstable"],
+)
+crate.annotation(
+    crate = "console-subscriber",
+    rustc_flags = ["--cfg=tokio_unstable"],
+)
+
 # Per-OS allocator pin (memory rule). Declared as platform-specific via
 # `target_compatible_with` semantics in crate_universe; konfig_bin selects
 # them on the corresponding @platforms//os: target.
