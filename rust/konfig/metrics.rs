@@ -67,6 +67,17 @@ lazy_static::lazy_static! {
     )
     .expect("failed to register konfig_broadcast_lag_total");
 
+    /// Number of synchronous snapshot replays sent to subscribers on
+    /// connection with empty resume_resource_version. `kind` is "config" or
+    /// "secret". Each label increment counts ONE subscriber, regardless of
+    /// snapshot event count.
+    pub static ref SUBSCRIBE_SNAPSHOT_EMITTED: CounterVec = register_counter_vec!(
+        "konfig_subscribe_snapshot_emitted_total",
+        "Subscribers that received a synchronous snapshot on connect (empty resume_rv)",
+        &["kind"]
+    )
+    .expect("failed to register konfig_subscribe_snapshot_emitted_total");
+
     /// Depth of the per-namespace replay buffer (sampled every 5 s).
     pub static ref REPLAY_BUFFER_DEPTH: GaugeVec = register_gauge_vec!(
         "konfig_replay_buffer_depth",

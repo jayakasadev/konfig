@@ -119,26 +119,21 @@ pub async fn handle_subscribe(
         Arc::clone(&watcher_handles),
     );
 
-    if !resume_rv.is_empty() {
-        // Resume path: attempt to replay from the in-memory buffer.
-        // On a hit: send only the missed events then join the broadcast.
-        // On a miss: send the full cache snapshot then join the broadcast.
-        // Either way: zero additional kube watch calls.
-        tokio::spawn(resume_from_buffer(
-            resume_rv,
-            replay_buf,
-            cache,
-            namespace.clone(),
-            bcast_rx,
-            tx,
-            drain_notify,
-        ));
-        return Ok(Response::new(ReceiverStream::new(rx)));
-    }
-
-    // Fresh subscribe (no resume_resource_version) — join live broadcast directly.
-    tokio::spawn(bridge_broadcast(bcast_rx, tx, namespace, drain_notify));
-
+    // Both resume and fresh-subscribe paths route through resume_from_buffer:
+    // - Non-empty resume_rv → buffer-hit replays missed events, buffer-miss
+    //   sends full snapshot + post-snapshot race-window events.
+    // - Empty resume_rv → falls through to buffer-miss path → sends full
+    //   snapshot synchronously as the first event(s) so a fresh subscriber
+    //   never has to wait for the next apply to receive any state.
+    tokio::spawn(resume_from_buffer(
+        resume_rv,
+        replay_buf,
+        cache,
+        namespace.clone(),
+        bcast_rx,
+        tx,
+        drain_notify,
+    ));
     Ok(Response::new(ReceiverStream::new(rx)))
 }
 
@@ -429,11 +424,14 @@ async fn resume_from_buffer(
         let mut snapshot_events: Vec<ConfigEvent> = Vec::with_capacity(snapshots.len());
         for snap in &snapshots {
             let event = ConfigEvent {
-                event_type: EventType::Modified as i32,
+                event_type: EventType::Snapshot as i32,
                 config: Some(snapshot_to_proto(snap)),
             };
             snapshot_events.push(event);
         }
+        crate::metrics::SUBSCRIBE_SNAPSHOT_EMITTED
+            .with_label_values(&["config"])
+            .inc();
         for event in &snapshot_events {
             match tx.try_send(Ok(event.clone())) {
                 Ok(()) => {}

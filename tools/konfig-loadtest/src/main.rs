@@ -931,7 +931,7 @@ const S3_WARM_APPLIES: u32 = 5;
 const S3_POST_APPLIES: u32 = 10;
 const S3_INTERVAL_MS: u64 = 100;
 const S3_DRAIN_SECS: u64 = 15;
-const S3_WARM_DRAIN_SECS: u64 = 5;
+const S3_WARM_DRAIN_SECS: u64 = 1;
 const S3_WARM_RV_QUORUM: usize = S3_SUBSCRIBERS;
 
 async fn scenario_reconnect_storm(
@@ -998,7 +998,7 @@ async fn scenario_reconnect_storm(
     info!("S3: {S3_SUBSCRIBERS} subscribers connected — waiting for warm events to land");
 
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(S3_WARM_DRAIN_SECS);
-    loop {
+    let (quorum_met, final_populated) = loop {
         let populated = last_rvs
             .lock()
             .await
@@ -1006,18 +1006,18 @@ async fn scenario_reconnect_storm(
             .filter(|rv| !rv.is_empty())
             .count();
         if populated >= S3_WARM_RV_QUORUM {
-            break;
+            break (true, populated);
         }
         if tokio::time::Instant::now() >= drain_deadline {
-            warn!(
+            error!(
                 populated,
                 quorum = S3_WARM_RV_QUORUM,
                 "S3: warm drain timeout — fewer subscribers have RV than quorum"
             );
-            break;
+            break (false, populated);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    };
 
     // Phase 4: abort all subscribers simultaneously (simulate disconnect).
     info!("S3: aborting all subscribers simultaneously");
@@ -1134,13 +1134,19 @@ async fn scenario_reconnect_storm(
         total_expected, total_received, missed, "S3 results"
     );
 
+    let mut failures: Vec<String> = Vec::new();
+    if !quorum_met {
+        failures.push(format!(
+            "warm-event RV quorum missed: {final_populated}/{S3_WARM_RV_QUORUM} subscribers reported a resource_version within {S3_WARM_DRAIN_SECS}s — Subscribe should emit a synchronous snapshot on connect"
+        ));
+    }
     if missed > 0 {
-        ScenarioResult::fail(
-            "reconnect_storm",
-            vec![format!("{missed} missed events post-reconnect")],
-        )
-    } else {
+        failures.push(format!("{missed} missed events post-reconnect"));
+    }
+    if failures.is_empty() {
         ScenarioResult::pass("reconnect_storm")
+    } else {
+        ScenarioResult::fail("reconnect_storm", failures)
     }
 }
 

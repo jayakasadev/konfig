@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::grpc::secret_get::secret_snapshot_to_proto;
 use crate::proto::{SecretEvent, SubscribeSecretsRequest, secret_event::EventType};
+use crate::secret_cache::SecretCache;
 use crate::secret_watcher::{MANAGED_LABEL, SCHEMA_VERSION_ANNOTATION};
 use crate::types::SecretSnapshot;
 
@@ -39,6 +40,7 @@ const BROADCAST_CAPACITY: usize = 1_024;
 
 pub async fn handle_subscribe_secrets(
     kube_client: Client,
+    secret_cache: Arc<SecretCache>,
     namespace_broadcasts: Arc<DashMap<String, broadcast::Sender<SecretEvent>>>,
     drain_notify: Arc<Notify>,
     req: SubscribeSecretsRequest,
@@ -67,6 +69,35 @@ pub async fn handle_subscribe_secrets(
             "no secret watcher running for namespace {namespace}"
         ))
     })?;
+
+    // Empty resume_rv: emit current cache state synchronously as SNAPSHOT
+    // events BEFORE bridging to the live broadcast, so a fresh subscriber
+    // never has to wait for the next ApplySecret to receive any state.
+    let snapshots = secret_cache.all_in_namespace(&namespace);
+    if !snapshots.is_empty() {
+        crate::metrics::SUBSCRIBE_SNAPSHOT_EMITTED
+            .with_label_values(&["secret"])
+            .inc();
+        for snap in &snapshots {
+            let event = SecretEvent {
+                event_type: EventType::Snapshot as i32,
+                secret: Some(secret_snapshot_to_proto(snap)),
+            };
+            if let Err(e) = tx.try_send(Ok(event)) {
+                match e {
+                    TrySendError::Full(_) => {
+                        warn!("SubscribeSecrets snapshot: subscriber slow — disconnecting");
+                        let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                        return Ok(Response::new(ReceiverStream::new(rx)));
+                    }
+                    TrySendError::Closed(_) => {
+                        info!("SubscribeSecrets snapshot: subscriber disconnected");
+                        return Ok(Response::new(ReceiverStream::new(rx)));
+                    }
+                }
+            }
+        }
+    }
 
     // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
     tokio::spawn(bridge_broadcast(bcast_rx, tx, drain_notify));
