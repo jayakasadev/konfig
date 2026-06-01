@@ -246,6 +246,7 @@ impl KonfigService for KonfigServer {
         check_drain(&self.draining)?;
         subscribe_secrets::handle_subscribe_secrets(
             self.kube_client.clone(),
+            Arc::clone(&self.secret_cache),
             Arc::clone(&self.secret_namespace_broadcasts),
             self.drain_notify(),
             request.into_inner(),
