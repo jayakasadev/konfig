@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "rust/konfig",
+    "rust/konfig-consumer",
     "tools/konfig-cli",
     "tools/konfig-loadtest",
 ]
