@@ -165,8 +165,6 @@ async fn patch_secret_with_retry(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn schema_version_downgrade_logic() {
         // incoming <= current → reject

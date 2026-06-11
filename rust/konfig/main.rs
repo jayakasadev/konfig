@@ -14,6 +14,7 @@
 //! 10. Start gRPC server (port 50051) — blocks until shutdown completes
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 // Per-OS allocator pin (memory rule: jemalloc on Linux pods, snmalloc on macOS dev).
@@ -33,6 +34,7 @@ use tokio::sync::{broadcast, oneshot};
 use tracing::info;
 
 use konfig::cache::ConfigCache;
+use konfig::grpc::tls::{TlsPaths, build_server_tls_config, warn_tls_disabled};
 use konfig::grpc::{ServerConfig, serve};
 use konfig::metrics::{LastEventAtMap, last_event_at_for, spawn_tokio_runtime_sampler};
 use konfig::proto::{SecretEvent, konfig_service_server::KonfigServiceServer};
@@ -74,6 +76,30 @@ struct Args {
         default_value = ""
     )]
     secret_namespaces: Vec<String>,
+
+    /// Enable mutual-TLS on the gRPC server. Default ON. Pass `--tls=false`
+    /// only for local dev / integration tests — never in production.
+    #[arg(
+        long,
+        env = "KONFIG_TLS",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    tls: bool,
+
+    /// PEM-encoded server certificate (presented on handshake). Required when
+    /// `--tls=true`. Ignored when `--tls=false`.
+    #[arg(long, env = "KONFIG_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM-encoded server private key. Required when `--tls=true`.
+    #[arg(long, env = "KONFIG_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM-encoded CA bundle used to verify client certificates. Required
+    /// when `--tls=true`. Every client must present a cert signed by this CA.
+    #[arg(long, env = "KONFIG_TLS_CLIENT_CA")]
+    tls_client_ca: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -102,6 +128,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let args = Args::parse();
+
+    // Resolve TLS configuration up-front so a missing flag fails startup before
+    // we touch the kube API or spawn any watcher. Default is mTLS-on; the
+    // `--tls=false` escape hatch is for local dev + integration tests only.
+    let tls_config = if args.tls {
+        let cert = args.tls_cert.clone().ok_or(
+            "TLS enabled but --tls-cert/KONFIG_TLS_CERT not set. \
+             Pass --tls=false to disable (local dev only).",
+        )?;
+        let key = args.tls_key.clone().ok_or(
+            "TLS enabled but --tls-key/KONFIG_TLS_KEY not set. \
+             Pass --tls=false to disable (local dev only).",
+        )?;
+        let client_ca = args.tls_client_ca.clone().ok_or(
+            "TLS enabled but --tls-client-ca/KONFIG_TLS_CLIENT_CA not set. \
+             Pass --tls=false to disable (local dev only).",
+        )?;
+        Some(
+            build_server_tls_config(&TlsPaths {
+                cert,
+                key,
+                client_ca,
+            })
+            .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+        )
+    } else {
+        warn_tls_disabled();
+        None
+    };
 
     // Spawn tokio runtime-metrics sampler — publishes `tokio_*` gauges every
     // 5 s on the same `/metrics` endpoint as the Prometheus app metrics.
@@ -230,6 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // too — better than hanging forever.
             let _ = shutdown_rx.await;
         })),
+        tls_config,
     })
     .await?;
 

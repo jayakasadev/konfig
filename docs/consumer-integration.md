@@ -153,3 +153,116 @@ if config.stale_since_ms >= 0:
 | `FAILED_PRECONDITION` | Apply rejected — `schema_version` not increasing | Fix the version and retry |
 | `NOT_FOUND` | Config does not exist | Create it first |
 | `RESOURCE_EXHAUSTED` | Subscriber too slow (ring buffer wrapped) | Reconnect with `resume_resource_version` |
+
+## mTLS client certs
+
+The konfig gRPC server requires mutual TLS by default. Every consumer must
+present a certificate signed by the same in-cluster CA the server uses
+(`Issuer/konfig-ca-issuer` in the `konfig-system` namespace).
+
+### 1. Issue a client `Certificate`
+
+In the consumer's namespace, request a cert from the cluster's konfig CA.
+Because the issuer lives in `konfig-system`, use a `ClusterIssuer` indirection
+or copy the CA secret with `trust-manager` — the example below assumes a
+`ClusterIssuer/konfig-ca-issuer` mirrored from the in-namespace `Issuer`:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-konfig-client
+  namespace: my-app
+spec:
+  secretName: my-app-konfig-client-tls
+  # CN identifies the caller in konfig logs; pick something stable per
+  # ServiceAccount, not per pod.
+  commonName: my-app.my-app.svc
+  duration: 2160h     # 90d
+  renewBefore: 720h   # 30d
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - client auth
+  issuerRef:
+    kind: ClusterIssuer
+    name: konfig-ca-issuer
+```
+
+### 2. Mount it in the consumer pod
+
+```yaml
+spec:
+  containers:
+    - name: my-app
+      volumeMounts:
+        - name: konfig-client-tls
+          mountPath: /var/run/konfig-client-tls
+          readOnly: true
+  volumes:
+    - name: konfig-client-tls
+      secret:
+        secretName: my-app-konfig-client-tls
+        defaultMode: 0o400
+```
+
+The Secret contains `tls.crt`, `tls.key`, and `ca.crt`. `ca.crt` is the
+trust anchor for the konfig server — clients need it to verify the server
+cert.
+
+### 3. Wire TLS into the client
+
+**Python** (`grpcio`):
+
+```python
+import grpc
+
+with open("/var/run/konfig-client-tls/ca.crt", "rb") as f:
+    root_ca = f.read()
+with open("/var/run/konfig-client-tls/tls.crt", "rb") as f:
+    client_cert = f.read()
+with open("/var/run/konfig-client-tls/tls.key", "rb") as f:
+    client_key = f.read()
+
+creds = grpc.ssl_channel_credentials(
+    root_certificates=root_ca,
+    private_key=client_key,
+    certificate_chain=client_cert,
+)
+channel = grpc.secure_channel(
+    "konfig.konfig-system.svc.cluster.local:50051",
+    creds,
+    # Required when CN != target host. Match the server cert's SAN.
+    options=[("grpc.ssl_target_name_override",
+              "konfig.konfig-system.svc.cluster.local")],
+)
+```
+
+**Rust** (`tonic`):
+
+```rust
+use tonic::transport::{Certificate, ClientTlsConfig, Channel, Identity};
+
+let ca = std::fs::read("/var/run/konfig-client-tls/ca.crt")?;
+let cert = std::fs::read("/var/run/konfig-client-tls/tls.crt")?;
+let key = std::fs::read("/var/run/konfig-client-tls/tls.key")?;
+
+let tls = ClientTlsConfig::new()
+    .ca_certificate(Certificate::from_pem(ca))
+    .identity(Identity::from_pem(cert, key))
+    .domain_name("konfig.konfig-system.svc.cluster.local");
+
+let channel = Channel::from_static(
+    "https://konfig.konfig-system.svc.cluster.local:50051"
+)
+.tls_config(tls)?
+.connect()
+.await?;
+```
+
+### Disabling TLS (local dev only)
+
+For local-only testing the konfig binary accepts `--tls=false`. The
+deployment manifests never pass this flag — production is always mTLS-on.

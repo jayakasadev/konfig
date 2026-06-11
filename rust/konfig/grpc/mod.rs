@@ -25,6 +25,7 @@ pub mod secret_apply;
 pub mod secret_get;
 pub mod subscribe;
 pub mod subscribe_secrets;
+pub mod tls;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -82,6 +83,10 @@ pub struct ServerConfig {
     ///
     /// When `None` the server never drains (test/CLI use).
     pub shutdown_signal: Option<ShutdownSignal>,
+    /// Optional TLS configuration. `Some` engages mTLS — every client must
+    /// present a cert signed by the configured CA. `None` runs in plaintext
+    /// (integration tests + `--tls=false` local dev).
+    pub tls_config: Option<tonic::transport::ServerTlsConfig>,
 }
 
 /// Type-erased shutdown future.  Boxed so the field doesn't push a generic
@@ -320,6 +325,10 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)));
+
+    if let Some(tls) = cfg.tls_config {
+        builder = builder.tls_config(tls)?;
+    }
 
     // Compose the shutdown future that `serve_with_shutdown` waits on.
     //

@@ -1,0 +1,31 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: konfig-server-tls
+  namespace: konfig-system
+spec:
+  # Secret holding tls.crt / tls.key / ca.crt — mounted by the konfig pod
+  # at /var/run/konfig-tls. cert-manager rewrites this Secret on rotation;
+  # use a controller like stakater/reloader to restart the pod on change,
+  # or rely on the next rolling update.
+  secretName: konfig-server-tls
+  commonName: konfig.konfig-system.svc.cluster.local
+  dnsNames:
+    - konfig
+    - konfig.konfig-system
+    - konfig.konfig-system.svc
+    - konfig.konfig-system.svc.cluster.local
+    # Headless / per-pod variants for future HA (StatefulSet) deployments.
+    - konfig-headless.konfig-system.svc
+    - konfig-headless.konfig-system.svc.cluster.local
+  duration: 2160h    # 90d
+  renewBefore: 720h  # 30d — cert-manager kicks off renewal well before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+  issuerRef:
+    kind: Issuer
+    name: konfig-ca-issuer

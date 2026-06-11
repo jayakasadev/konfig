@@ -41,6 +41,15 @@ spec:
                   matchLabels:
                     app: konfig
                 topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: konfig-tls
+          secret:
+            # Written by cert-manager from certificate.yaml. Contains
+            # tls.crt, tls.key, ca.crt. defaultMode tightens perms on the
+            # private key so non-root containers can still read it but no
+            # other user can.
+            secretName: konfig-server-tls
+            defaultMode: 0o400
       containers:
         - name: konfig
           # Tag is rewritten to the merged-commit short SHA by
@@ -52,6 +61,15 @@ spec:
             - --namespace=$(KONFIG_NAMESPACE)
             - --name=$(KONFIG_NAME)
             - --secret-namespaces=konfig-system
+            # mTLS — default is on; do NOT pass --tls=false in production.
+            - --tls=true
+            - --tls-cert=/var/run/konfig-tls/tls.crt
+            - --tls-key=/var/run/konfig-tls/tls.key
+            - --tls-client-ca=/var/run/konfig-tls/ca.crt
+          volumeMounts:
+            - name: konfig-tls
+              mountPath: /var/run/konfig-tls
+              readOnly: true
           env:
             - name: KONFIG_NAMESPACE
               valueFrom:
@@ -75,17 +93,22 @@ spec:
             limits:
               cpu: 1000m
               memory: 512Mi
+          # mTLS makes the built-in kubelet `grpc:` probe unusable (kubelet has
+          # no client cert). Drop to TCP probes — they verify the listener is
+          # up. Service-level health (cache populated, watcher connected) is
+          # still exposed on the gRPC Health RPC for in-mesh callers; the
+          # readiness check shifts to "cache populated → set_serving" gating
+          # the LB removal via the broadcaster, which already triggers on
+          # drain. See docs/runbook.md → "TLS / cert rotation".
           readinessProbe:
-            grpc:
-              port: 50051
-              service: konfig.v1.KonfigService
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
-            grpc:
-              port: 50051
-              service: konfig.v1.KonfigService
+            tcpSocket:
+              port: grpc
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3

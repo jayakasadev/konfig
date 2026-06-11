@@ -23,6 +23,10 @@ resources:
   - service.yaml
   - configmap.yaml
   - pdb.yaml
+  # cert-manager Issuer + CA Certificate. Must be present before
+  # certificate.yaml + deployment.yaml so the server-cert Secret exists.
+  - issuer.yaml
+  - certificate.yaml
   - deployment.yaml
   - networkpolicy.yaml
 

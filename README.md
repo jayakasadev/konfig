@@ -6,14 +6,30 @@ receives changes within milliseconds via a gRPC stream. No restarts required.
 
 ## Install
 
+konfig requires [cert-manager](https://cert-manager.io/) to mint the gRPC
+server cert and the consumer client certs (mTLS is on by default).
+
 ```bash
-# CRD first — the kube-rs watcher panics at startup if the CRD is not Established.
+# 1. cert-manager (skip if already installed cluster-wide).
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --set crds.enabled=true
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=120s
+
+# 2. CRD first — the kube-rs watcher panics at startup if the CRD is not Established.
 kubectl apply -f infra/konfig/crd.yaml
 kubectl wait --for=condition=Established crd/configs.konfig.io --timeout=30s
 
-# Then the rest.
+# 3. Then the rest.
 kubectl apply -k infra/konfig/
 ```
+
+mTLS is enforced by default — see
+[consumer-integration.md → mTLS client certs](docs/consumer-integration.md#mtls-client-certs)
+for how to issue a client cert to your consumer pod. For local dev pass
+`--tls=false` to the konfig binary (never in production).
 
 Requires Kubernetes ≥ 1.29. See [Configuration](docs/configuration.md) for the
 ConfigMap + Deployment args that drive runtime behaviour.

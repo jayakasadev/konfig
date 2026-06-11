@@ -86,3 +86,80 @@ dial9 serve --local-dir /tmp/dial9-traces --port 9191
 ```
 
 Enable tracing first (see [Configuration](configuration.md#telemetry)).
+
+## TLS / cert rotation
+
+mTLS is enforced by default. Certs are issued by cert-manager from
+`Issuer/konfig-ca-issuer` in the `konfig-system` namespace, anchored at the
+self-signed root in `Secret/konfig-ca-key-pair`. The server reads its
+material at startup; cert-manager rewriting the underlying Secret does NOT
+hot-reload — the pod must restart to pick up new certs.
+
+### Verify cert expiry
+
+```bash
+# Server cert
+kubectl -n konfig-system get certificate konfig-server-tls \
+  -o jsonpath='{.status.notAfter}'
+
+# Or decode the live Secret
+kubectl -n konfig-system get secret konfig-server-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -noout -enddate -subject -issuer
+```
+
+cert-manager renews 30d before expiry (`renewBefore: 720h` in
+`infra/konfig/certificate.yaml`). Watch for `CertificateRequest` resources
+in `konfig-system` if you want to see renewals in flight.
+
+### Rotate the root CA
+
+The CA cert lives 10y (`duration: 87600h` in `infra/konfig/issuer.yaml`)
+and renews 1y before expiry. To force a rotation:
+
+```bash
+# 1. Re-issue the CA (cert-manager re-mints into the same Secret).
+kubectl -n konfig-system delete certificate konfig-ca
+kubectl apply -k infra/konfig/
+
+# 2. Roll the konfig pod so it loads the new chain.
+kubectl -n konfig-system rollout restart deployment/konfig
+
+# 3. Every consumer must also roll once its client Certificate is re-issued
+#    by the new CA (cert-manager handles re-issue; consumers handle the pod
+#    restart).
+```
+
+In production, replace the bootstrap self-signed `Issuer` + CA `Certificate`
+with a `secretName: konfig-ca-key-pair` you populate from your org PKI
+(Vault, AWS PCA, step-ca). The leaf-issuing `Issuer/konfig-ca-issuer` stays
+unchanged.
+
+### Pod restart on cert renewal
+
+The current deployment does NOT auto-restart on Secret rotation. Options:
+
+- Annotate the Deployment with [`reloader.stakater.com/auto: "true"`](https://github.com/stakater/Reloader)
+  if reloader is installed cluster-wide. (Not enabled by default.)
+- Manually run `kubectl rollout restart deployment/konfig` after each
+  renewal. cert-manager only renews 30d before expiry, so the cadence is
+  predictable.
+
+### cert-manager unreachable
+
+If cert-manager is down or its CRDs are missing when konfig is reinstalled,
+the `Certificate/konfig-server-tls` resource will not be reconciled and the
+`Secret/konfig-server-tls` will not exist. The konfig pod will fail to start
+with `failed to read server cert at /var/run/konfig-tls/tls.crt`.
+
+Existing pods continue to run on whatever cert they loaded at startup — they
+do NOT lose mTLS just because cert-manager is unhealthy. The risk window is
+"cert expires while cert-manager is down". Monitor cert-manager liveness
+separately.
+
+### Disabling TLS for local dev
+
+`--tls=false` skips all of the above and runs the gRPC server in plaintext.
+The startup logs include `WARN: TLS disabled; gRPC server is unauthenticated`
+once on boot. The production manifests in `infra/konfig/` never set this
+flag.

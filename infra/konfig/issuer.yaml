@@ -1,0 +1,53 @@
+# mTLS PKI bootstrap.
+#
+# Three resources, in order:
+#   1. konfig-selfsigned-bootstrap — a self-signed Issuer used ONLY to mint
+#      our long-lived CA cert in step 2. Never issues leaf certs directly.
+#   2. konfig-ca — a Certificate (signed by #1) whose private key becomes the
+#      shared root for the mTLS mesh. cert-manager writes the cert + key to
+#      Secret `konfig-ca-key-pair`.
+#   3. konfig-ca-issuer — the CA Issuer referenced by `certificate.yaml`
+#      (server cert) AND by every consumer's client `Certificate`. Signs leaf
+#      certs with the key from #2 so all parties chain to the same root.
+#
+# Production: replace step 1+2 by importing your existing org PKI root into
+# `konfig-ca-key-pair` (Vault, AWS PCA, step-ca, etc.) — leave step 3 as is.
+# Treat the private key in `konfig-ca-key-pair` as sensitive: do NOT commit it
+# and restrict the Secret with RBAC.
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: konfig-selfsigned-bootstrap
+  namespace: konfig-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: konfig-ca
+  namespace: konfig-system
+spec:
+  isCA: true
+  commonName: konfig-ca
+  secretName: konfig-ca-key-pair
+  # 10y — long-lived root; rotate by re-issuing this Certificate and rolling
+  # the dependent leaf certs. See docs/runbook.md → "TLS / cert rotation".
+  duration: 87600h
+  renewBefore: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    kind: Issuer
+    name: konfig-selfsigned-bootstrap
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: konfig-ca-issuer
+  namespace: konfig-system
+spec:
+  ca:
+    secretName: konfig-ca-key-pair
