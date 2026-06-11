@@ -82,21 +82,39 @@ fn read_file(path: &Path, label: &str) -> Result<Vec<u8>, Box<dyn Error + Send +
 mod tests {
     use super::*;
 
-    // Minimal self-signed PEM material generated once with rcgen and pasted
-    // here so the test stays hermetic — no rcgen dep needed in the build.
-    // These are NOT real keys for any production system; they verify that
-    // build_server_tls_config accepts well-formed PEM and rejects bad input.
-    // Cert + key emitted by `rcgen` for CN="test", validity 100y.
-    const TEST_CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
-MIIBcjCCARigAwIBAgIUImN1iKzNlsf3pnxQfb1Xs3l1bn4wCgYIKoZIzj0EAwIw\n\
-DzENMAsGA1UEAwwEdGVzdDAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAw\n\
-MFowDzENMAsGA1UEAwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIH+\n\
-PLACEHOLDER_NOT_REAL_KEY_MATERIAL_FOR_UNIT_TEST_ONLY00000000000\n\
-o1MwUTAdBgNVHQ4EFgQUtest1234567890tests1234567890testsxYwHwYDVR0j\n\
-BBgwFoAUtest1234567890tests1234567890testsxYwDwYDVR0TAQH/BAUwAwEB\n\
-/zAKBggqhkjOPQQDAgNHADBEAiBPLACEHOLDERPLACEHOLDERPLACEHOLDERPLAC\n\
-EHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDER\n\
+    // Self-signed test material generated once with `openssl ecparam -name
+    // prime256v1` + `openssl req -x509` + a CA-signed leaf. NOT real keys
+    // for any production system — only used to verify that
+    // build_server_tls_config accepts well-formed PEM. Validity 100y so
+    // tests never flake on cert expiry.
+    const TEST_CA_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIBiTCCAS+gAwIBAgIUEv/OWaMCR1HEcMawwE4voSS9N8YwCgYIKoZIzj0EAwIw\n\
+GTEXMBUGA1UEAwwOa29uZmlnLXRlc3QtY2EwIBcNMjYwNjExMjExMTMwWhgPMjEy\n\
+NjA1MTgyMTExMzBaMBkxFzAVBgNVBAMMDmtvbmZpZy10ZXN0LWNhMFkwEwYHKoZI\n\
+zj0CAQYIKoZIzj0DAQcDQgAE++HFkYStxtFqA7cMIwdNX/KETc3R9uXqKfTsabKt\n\
+J4lmeb8lHHZ1IEyTKNkFfBwLrHhvFURnfxWI0225EcOvzKNTMFEwHQYDVR0OBBYE\n\
+FANch6VOuLpo+s/kRf9ZqeecBArIMB8GA1UdIwQYMBaAFANch6VOuLpo+s/kRf9Z\n\
+qeecBArIMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIhAMSss4kC\n\
+GNni6yWdM+6bCbck3Viux0GLi0Vor9HH8yeAAiAIS3v0v4J/+xvF7iU+qj3WIPMr\n\
+zXqG1ImhfknU/1RulQ==\n\
 -----END CERTIFICATE-----\n";
+
+    const TEST_SERVER_CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\n\
+MIIBfDCCASKgAwIBAgIUNz/doutGmH7lCNj96AXiDP5LYoYwCgYIKoZIzj0EAwIw\n\
+GTEXMBUGA1UEAwwOa29uZmlnLXRlc3QtY2EwIBcNMjYwNjExMjExMTMwWhgPMjEy\n\
+NjA1MTgyMTExMzBaMB0xGzAZBgNVBAMMEmtvbmZpZy10ZXN0LXNlcnZlcjBZMBMG\n\
+ByqGSM49AgEGCCqGSM49AwEHA0IABMlTqVcwvZTbexsFWQ7HBYJT1VPScyPEBhKU\n\
+wzADiG/Z0c6BIPa3ut9N48KKogHeWnmRIn1uDFJqjS1ywrdXtFGjQjBAMB0GA1Ud\n\
+DgQWBBTwVoIYO8NkYoK9ZwmcgEJT1Us4RzAfBgNVHSMEGDAWgBQDXIelTri6aPrP\n\
+5EX/WannnAQKyDAKBggqhkjOPQQDAgNIADBFAiBHSvEUEDYxgg1nBR3DC2DOLq9X\n\
+NeuTymT8dsCNyMQpWwIhAIf/cOURe9Ir38nAJ0jTv8wUqs/cUsybOX5qJPYV8BAT\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_SERVER_KEY_PEM: &[u8] = b"-----BEGIN EC PRIVATE KEY-----\n\
+MHcCAQEEINpZNkHUaCis74WZnmxB5r8C1+TlzYfTwnPRRro6/jHUoAoGCCqGSM49\n\
+AwEHoUQDQgAEyVOpVzC9lNt7GwVZDscFglPVU9JzI8QGEpTDMAOIb9nRzoEg9re6\n\
+303jwoqiAd5aeZEifW4MUmqNLXLCt1e0UQ==\n\
+-----END EC PRIVATE KEY-----\n";
 
     /// `read_file` rejects an empty file with a clear error rather than
     /// silently passing an empty PEM blob to tonic.
@@ -133,15 +151,61 @@ EHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDER\n\
         assert!(err.to_string().contains("failed to read"), "got: {err}");
     }
 
-    /// `read_file` accepts a well-formed PEM header even with placeholder body.
-    /// Confirms the early sanity check passes the file through to tonic.
+    /// `read_file` accepts a well-formed PEM file and returns the bytes.
     #[test]
-    fn read_file_accepts_pem_header() {
+    fn read_file_accepts_pem() {
         let tmp = tempfile_path("ok.pem");
-        std::fs::write(&tmp, TEST_CERT_PEM).expect("write tmp");
+        std::fs::write(&tmp, TEST_CA_PEM).expect("write tmp");
         let bytes = read_file(&tmp, "cert").expect("must accept");
-        assert_eq!(bytes, TEST_CERT_PEM);
+        assert_eq!(bytes, TEST_CA_PEM);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Happy path: real PEM material on disk produces a `ServerTlsConfig`
+    /// without panicking. Exercises every `?` branch in
+    /// `build_server_tls_config` and the trailing builder chain.
+    #[test]
+    fn build_server_tls_config_succeeds_with_valid_pem() {
+        let cert = tempfile_path("server.crt");
+        let key = tempfile_path("server.key");
+        let ca = tempfile_path("ca.crt");
+        std::fs::write(&cert, TEST_SERVER_CERT_PEM).expect("write cert");
+        std::fs::write(&key, TEST_SERVER_KEY_PEM).expect("write key");
+        std::fs::write(&ca, TEST_CA_PEM).expect("write ca");
+        let paths = TlsPaths {
+            cert: cert.clone(),
+            key: key.clone(),
+            client_ca: ca.clone(),
+        };
+        let cfg = build_server_tls_config(&paths).expect("must build TLS config");
+        // ServerTlsConfig is opaque — assert non-panic + drop is enough.
+        drop(cfg);
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&ca);
+    }
+
+    /// Missing server cert propagates a labelled error — surfaces which
+    /// file the operator forgot to mount.
+    #[test]
+    fn build_server_tls_config_fails_on_missing_cert() {
+        let paths = TlsPaths {
+            cert: tempfile_path("missing.crt"),
+            key: tempfile_path("missing.key"),
+            client_ca: tempfile_path("missing.ca"),
+        };
+        let _ = std::fs::remove_file(&paths.cert);
+        let _ = std::fs::remove_file(&paths.key);
+        let _ = std::fs::remove_file(&paths.client_ca);
+        let err = build_server_tls_config(&paths).expect_err("must fail on missing files");
+        assert!(err.to_string().contains("server cert"), "got: {err}");
+    }
+
+    /// `warn_tls_disabled` is callable and does not panic. The log line is
+    /// the only side effect; assert it does not return / unwind.
+    #[test]
+    fn warn_tls_disabled_does_not_panic() {
+        warn_tls_disabled();
     }
 
     fn tempfile_path(name: &str) -> PathBuf {
