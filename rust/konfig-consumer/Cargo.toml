@@ -1,0 +1,30 @@
+[package]
+name = "konfig-consumer"
+version.workspace = true
+edition.workspace = true
+publish = false
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+name = "konfig_consumer"
+path = "src/lib.rs"
+
+[dependencies]
+arc-swap = {workspace = true}
+futures-util = "0.3"
+kube = {version = "0.98", features = ["runtime", "client"]}
+k8s-openapi = {version = "0.24", features = ["v1_31"]}
+prometheus = {version = "0.14", default-features = false}
+serde = {workspace = true}
+serde_json = {workspace = true}
+thiserror = {workspace = true}
+tokio = {workspace = true, features = ["full"]}
+tracing = {workspace = true}
+
+[dev-dependencies]
+tokio = {version = "1.52.3", features = ["test-util", "macros", "rt"]}
+
+[lints.clippy]
+std_instead_of_core = "allow"
+std_instead_of_alloc = "allow"

@@ -1,0 +1,53 @@
+load("@rules_rust//rust:defs.bzl", "rust_clippy", "rust_doc", "rust_doc_test", "rust_library", "rust_test", "rustfmt_test")
+
+rust_library(
+    name = "konfig_consumer",
+    srcs = glob(["src/**/*.rs"]),
+    tags = ["konfig", "konfig-consumer", "rust"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@konfig_crates//:arc-swap",
+        "@konfig_crates//:futures-util",
+        "@konfig_crates//:k8s-openapi",
+        "@konfig_crates//:kube",
+        "@konfig_crates//:prometheus",
+        "@konfig_crates//:serde",
+        "@konfig_crates//:serde_json",
+        "@konfig_crates//:thiserror",
+        "@konfig_crates//:tokio",
+        "@konfig_crates//:tracing",
+    ],
+)
+
+rust_test(
+    name = "test",
+    size = "small",
+    crate = ":konfig_consumer",
+    tags = ["konfig", "konfig-consumer", "rust", "unit"],
+)
+
+rust_doc(
+    name = "doc",
+    crate = ":konfig_consumer",
+    tags = ["konfig", "konfig-consumer", "rust"],
+)
+
+rust_doc_test(
+    name = "doc_test",
+    crate = ":konfig_consumer",
+    tags = ["konfig", "konfig-consumer", "rust", "unit"],
+)
+
+rustfmt_test(
+    name = "fmt_test",
+    size = "small",
+    tags = ["konfig", "konfig-consumer", "rust", "unit"],
+    targets = [":konfig_consumer"],
+)
+
+rust_clippy(
+    name = "clippy_test",
+    testonly = True,
+    tags = ["konfig", "konfig-consumer", "rust", "unit"],
+    deps = [":konfig_consumer"],
+)

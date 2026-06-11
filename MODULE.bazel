@@ -187,6 +187,7 @@ crate.from_cargo(
     manifests = [
         "//:Cargo.toml",
         "//rust/konfig:Cargo.toml",
+        "//rust/konfig-consumer:Cargo.toml",
         "//tools/konfig-cli:Cargo.toml",
         "//tools/konfig-loadtest:Cargo.toml",
     ],
