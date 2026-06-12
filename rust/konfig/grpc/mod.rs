@@ -412,7 +412,9 @@ pub(crate) fn snapshot_to_proto(snap: &crate::types::ConfigSnapshot) -> Config {
         namespace: snap.namespace.clone(),
         name: snap.name.clone(),
         schema_version: snap.schema_version,
-        content_json: snap.content_json(),
+        // Clone the cached &str into the proto String; the underlying
+        // serde_json::to_string ran exactly once per snapshot, not per RPC.
+        content_json: snap.content_json().to_owned(),
         resource_version: snap.resource_version.clone(),
         age_ms: snap.loaded_at.elapsed().as_millis() as i64,
         stale_since_ms: snap
