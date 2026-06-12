@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
+use crate::cache_key::{BorrowedKey, KeyRef, OwnedKey};
 use crate::types::ConfigSnapshot;
 
 // ── ConfigCache ───────────────────────────────────────────────────────────────
 
-type Inner = HashMap<(String, String), Arc<ConfigSnapshot>>;
+type Inner = HashMap<OwnedKey, Arc<ConfigSnapshot>>;
 
 /// Shared, lock-free multi-key cache for [`ConfigSnapshot`].
 ///
@@ -37,7 +38,7 @@ impl ConfigCache {
     pub fn new(initial: ConfigSnapshot) -> Self {
         let mut map = Inner::new();
         if !initial.namespace.is_empty() && !initial.name.is_empty() {
-            let key = (initial.namespace.clone(), initial.name.clone());
+            let key = OwnedKey::new(initial.namespace.clone(), initial.name.clone());
             map.insert(key, Arc::new(initial));
         }
         Self {
@@ -49,12 +50,12 @@ impl ConfigCache {
     /// Look up a snapshot by `(namespace, name)`.
     ///
     /// Returns `None` when no entry has been inserted for this key yet.
-    /// Zero locking — atomic pointer load only.
+    /// Zero locking — atomic pointer load only.  Lookup is allocation-free:
+    /// the `BorrowedKey` view passes `(&str, &str)` straight to the
+    /// `HashMap` via the `Borrow<dyn KeyRef>` impl on [`OwnedKey`].
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<ConfigSnapshot>> {
-        self.inner
-            .load()
-            .get(&(namespace.to_owned(), name.to_owned()))
-            .cloned()
+        let q = BorrowedKey::new(namespace, name);
+        self.inner.load().get(&q as &dyn KeyRef).cloned()
     }
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
@@ -62,7 +63,10 @@ impl ConfigCache {
         let _guard = self.write_lock.lock().unwrap();
         let current = self.inner.load();
         let mut next = (**current).clone();
-        next.insert((snap.namespace.clone(), snap.name.clone()), Arc::new(snap));
+        next.insert(
+            OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
+            Arc::new(snap),
+        );
         self.inner.store(Arc::new(next));
     }
 
@@ -71,7 +75,8 @@ impl ConfigCache {
         let _guard = self.write_lock.lock().unwrap();
         let current = self.inner.load();
         let mut next = (**current).clone();
-        next.remove(&(namespace.to_owned(), name.to_owned()));
+        let q = BorrowedKey::new(namespace, name);
+        next.remove(&q as &dyn KeyRef);
         self.inner.store(Arc::new(next));
     }
 
@@ -81,7 +86,7 @@ impl ConfigCache {
         self.inner
             .load()
             .iter()
-            .filter(|(k, _)| k.0 == namespace)
+            .filter(|(k, _)| k.namespace == namespace)
             .map(|(_, v)| Arc::clone(v))
             .collect()
     }
