@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 
+use crate::cache_key::{BorrowedKey, KeyRef, OwnedKey};
 use crate::types::SecretSnapshot;
 
-type Inner = HashMap<(String, String), Arc<SecretSnapshot>>;
+type Inner = HashMap<OwnedKey, Arc<SecretSnapshot>>;
 
 pub struct SecretCache {
     inner: ArcSwap<Inner>,
@@ -30,19 +31,21 @@ impl SecretCache {
         }
     }
 
-    /// Zero locking — atomic pointer load only.
+    /// Zero locking — atomic pointer load only.  Lookup is allocation-free
+    /// via the `BorrowedKey` / `Borrow<dyn KeyRef>` trick.
     pub fn get(&self, namespace: &str, name: &str) -> Option<Arc<SecretSnapshot>> {
-        self.inner
-            .load()
-            .get(&(namespace.to_owned(), name.to_owned()))
-            .cloned()
+        let q = BorrowedKey::new(namespace, name);
+        self.inner.load().get(&q as &dyn KeyRef).cloned()
     }
 
     pub fn update(&self, snap: SecretSnapshot) {
         let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
-        next.insert((snap.namespace.clone(), snap.name.clone()), Arc::new(snap));
+        next.insert(
+            OwnedKey::new(snap.namespace.clone(), snap.name.clone()),
+            Arc::new(snap),
+        );
         self.inner.store(Arc::new(next));
     }
 
@@ -50,7 +53,8 @@ impl SecretCache {
         let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
-        next.remove(&(namespace.to_owned(), name.to_owned()));
+        let q = BorrowedKey::new(namespace, name);
+        next.remove(&q as &dyn KeyRef);
         self.inner.store(Arc::new(next));
     }
 
@@ -59,7 +63,7 @@ impl SecretCache {
         self.inner
             .load()
             .iter()
-            .filter(|(k, _)| k.0 == namespace)
+            .filter(|(k, _)| k.namespace == namespace)
             .map(|(_, v)| Arc::clone(v))
             .collect()
     }
