@@ -144,11 +144,14 @@ async fn patch_secret_with_retry(
             }
             Err(e) => match classify_secret_patch_error(&e, attempt) {
                 SecretPatchRetryDecision::RetryAfter { delay_ms } => {
+                    // ±25 % jitter — see `crate::grpc::jittered_retry_ms`.
+                    let jittered = crate::grpc::jittered_retry_ms(delay_ms);
                     warn!(
                         attempt = attempt + 1,
-                        delay_ms, "ApplySecret: 409 — retrying"
+                        delay_ms = jittered,
+                        "ApplySecret: 409 — retrying",
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(jittered)).await;
                     attempt += 1;
                 }
                 SecretPatchRetryDecision::AbortRetriesExhausted => {

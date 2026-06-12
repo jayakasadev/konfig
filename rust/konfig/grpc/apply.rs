@@ -16,6 +16,7 @@ use serde_json::json;
 use tonic::{Response, Status};
 use tracing::{debug, info, warn};
 
+use crate::grpc::jittered_retry_ms;
 use crate::metrics::{APPLY_DURATION, APPLY_TOTAL};
 use crate::proto::{ApplyRequest, ApplyResponse};
 use crate::types::ConfigSpec;
@@ -170,11 +171,15 @@ async fn patch_with_retry(
             Ok(obj) => return Ok(obj.metadata.resource_version.unwrap_or_default()),
             Err(e) => match classify_patch_error(&e, attempt) {
                 PatchRetryDecision::RetryAfter { delay_ms } => {
+                    // ±25 % jitter to break lockstep retries from N clients
+                    // racing on the same resourceVersion (see `jittered_retry_ms`).
+                    let jittered = jittered_retry_ms(delay_ms);
                     warn!(
                         attempt = attempt + 1,
-                        delay_ms, "Apply: 409 Conflict — retrying"
+                        delay_ms = jittered,
+                        "Apply: 409 Conflict — retrying",
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(jittered)).await;
                     attempt += 1;
                 }
                 PatchRetryDecision::AbortRetriesExhausted => {
