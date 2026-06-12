@@ -584,17 +584,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "direct-cargo-bazel-deps"
-version = "0.0.1"
-dependencies = [
- "console-subscriber",
- "pyroscope",
- "pyroscope_pprofrs",
- "snmalloc-rs",
- "tikv-jemallocator",
-]
-
-[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3040,6 +3029,7 @@ dependencies = [
  "socket2 0.6.3",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.5.3",
  "tower-layer",
