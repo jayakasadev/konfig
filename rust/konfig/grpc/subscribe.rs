@@ -396,13 +396,37 @@ pub async fn gc_task(
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     loop {
         interval.tick().await;
-        gc_tick(
-            Instant::now(),
-            &namespace_broadcasts,
-            &namespace_replay_buffers,
-            &watcher_handles,
-            &idle_since,
-        );
+        // Wrap the sweep in `catch_unwind` so a transient panic inside
+        // `gc_tick` (lock poison, DashMap invariant violation, etc.) does
+        // not silently kill the entire GC task for the rest of the pod's
+        // lifetime — which would leak idle-namespace watchers indefinitely.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gc_tick(
+                Instant::now(),
+                &namespace_broadcasts,
+                &namespace_replay_buffers,
+                &watcher_handles,
+                &idle_since,
+            )
+        }));
+        if let Err(payload) = result {
+            warn!(
+                payload = ?panic_message(&payload),
+                "gc_task: gc_tick panicked — continuing loop",
+            );
+        }
+    }
+}
+
+/// Extract the panic message text from a `Box<dyn Any + Send>` payload — the
+/// common forms `&'static str` and `String`. Anything else gets `"<opaque>"`.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<opaque>"
     }
 }
 
@@ -1448,5 +1472,34 @@ mod tests {
         drop(rx); // close receiver
         let outcome = try_send_or_disconnect(&tx, make_event("0", 0), "test");
         assert!(matches!(outcome, std::ops::ControlFlow::Break(())));
+    }
+
+    /// `panic_message` covers the three payload shapes `catch_unwind`
+    /// hands back in practice: `&'static str` (from `panic!("…")` with a
+    /// string literal), `String` (from `panic!("{x}")` with formatting),
+    /// and anything else (returned as the placeholder `"<opaque>"`).
+    #[test]
+    fn panic_message_handles_str_string_and_other() {
+        let p_str: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&p_str), "boom");
+        let p_string: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
+        assert_eq!(panic_message(&p_string), "kaboom");
+        let p_other: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message(&p_other), "<opaque>");
+    }
+
+    /// `gc_task`'s `catch_unwind` wrap must not unwind out of the loop —
+    /// drive a panicking inner function and confirm the helper returns
+    /// `Err(payload)` (which the loop logs + continues). Tests the
+    /// wrapper in isolation; the loop itself is infinite so we don't
+    /// drive it end-to-end here.
+    #[test]
+    fn catch_unwind_captures_panic_without_propagating() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("synthetic gc_tick panic");
+        }));
+        assert!(result.is_err(), "panic must be captured, not propagated");
+        let payload = result.unwrap_err();
+        assert_eq!(panic_message(&payload), "synthetic gc_tick panic");
     }
 }

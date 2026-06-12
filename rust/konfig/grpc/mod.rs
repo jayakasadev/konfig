@@ -290,17 +290,31 @@ pub async fn serve(cfg: ServerConfig) -> Result<(), tonic::transport::Error> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                for entry in replay_buffers_for_sampler.iter() {
-                    let depth = entry.value().lock().expect("replay buffer poisoned").len();
-                    REPLAY_BUFFER_DEPTH
-                        .with_label_values(&[entry.key()])
-                        .set(depth as f64);
-                }
-                // konfig_stale_seconds: seconds since last event per namespace.
-                // None = cold start (no event received yet) → publish 0 (fresh).
-                for entry in last_event_at_for_sampler.iter() {
-                    let secs = entry.value().elapsed_secs().unwrap_or(0.0);
-                    STALE_SECONDS.with_label_values(&[entry.key()]).set(secs);
+                // Catch panics inside the sweep so a transient
+                // prometheus-internal panic, lock poison, etc. does not
+                // silently kill the sampler for the lifetime of the pod
+                // (which would freeze the konfig_stale_seconds /
+                // konfig_replay_buffer_depth gauges).
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for entry in replay_buffers_for_sampler.iter() {
+                        let depth = entry
+                            .value()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .len();
+                        REPLAY_BUFFER_DEPTH
+                            .with_label_values(&[entry.key()])
+                            .set(depth as f64);
+                    }
+                    // konfig_stale_seconds: seconds since last event per namespace.
+                    // None = cold start (no event received yet) → publish 0 (fresh).
+                    for entry in last_event_at_for_sampler.iter() {
+                        let secs = entry.value().elapsed_secs().unwrap_or(0.0);
+                        STALE_SECONDS.with_label_values(&[entry.key()]).set(secs);
+                    }
+                }));
+                if result.is_err() {
+                    warn!("metric sampler: tick panicked — continuing loop");
                 }
             }
         });
