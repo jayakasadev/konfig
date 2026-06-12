@@ -22,7 +22,7 @@ jobs:
   publish:
     name: Push multi-arch images + pin manifest SHAs
     if: "!contains(github.event.head_commit.message, '[skip publish]')"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
