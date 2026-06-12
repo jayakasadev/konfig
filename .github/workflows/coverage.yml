@@ -97,23 +97,12 @@ jobs:
             fi
           } > /tmp/combined_report.md
 
-      - name: Find existing quality comment
-        if: always()
-        uses: peter-evans/find-comment@v3
-        id: find-quality-comment
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: github-actions[bot]
-          body-includes: "<!-- ci-quality-report -->"
-
       - name: Post combined quality report
         if: always()
-        uses: peter-evans/create-or-update-comment@v4
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
-          comment-id: ${{ steps.find-quality-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          body-path: /tmp/combined_report.md
-          edit-mode: replace
+          header: ci-quality-report
+          path: /tmp/combined_report.md
 
       - name: Enforce CRAP threshold
         if: always() && steps.crap.outcome == 'failure'
