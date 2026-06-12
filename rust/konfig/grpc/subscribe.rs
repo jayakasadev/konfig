@@ -128,8 +128,11 @@ pub async fn handle_subscribe(
     }
 
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let namespace = req.namespace.clone();
-    let resume_rv = req.resume_resource_version.clone();
+    // Move req fields out instead of cloning — req is dropped at function exit.
+    // Single clone for the get_or_create_broadcast call; resume_from_buffer
+    // takes the original move.
+    let namespace = req.namespace;
+    let resume_rv = req.resume_resource_version;
 
     // Get or create the broadcast receiver and replay buffer for this namespace.
     let (bcast_rx, replay_buf) = get_or_create_broadcast(
@@ -150,7 +153,7 @@ pub async fn handle_subscribe(
         resume_rv,
         replay_buf,
         cache,
-        namespace.clone(),
+        namespace,
         bcast_rx,
         tx,
         drain_notify,
@@ -341,13 +344,17 @@ pub fn gc_tick(
 ) {
     // Collect namespaces eligible for GC — never hold DashMap entry refs across
     // any subsequent mutation (DashMap deadlocks if you do).
+    //
+    // Defer the `entry.key().clone()` to inside the `count == 0` branch so the
+    // common case (subscriber present) does zero allocation per sweep.  The
+    // `idle_since.remove` branch passes `entry.key()` directly (`Borrow<str>`).
     let to_gc: Vec<String> = namespace_broadcasts
         .iter()
         .filter_map(|entry| {
-            let ns = entry.key().clone();
             let count = entry.value().receiver_count();
             if count == 0 {
                 // No active receivers — check how long the channel has been idle.
+                let ns = entry.key().clone();
                 let since = *idle_since
                     .entry(ns.clone())
                     .or_insert_with(Instant::now)
@@ -358,8 +365,8 @@ pub fn gc_tick(
                     None
                 }
             } else {
-                // Still active — reset the idle timer.
-                idle_since.remove(&ns);
+                // Still active — reset the idle timer without cloning the key.
+                idle_since.remove(entry.key());
                 None
             }
         })
