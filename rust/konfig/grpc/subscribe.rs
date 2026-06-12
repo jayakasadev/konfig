@@ -924,12 +924,18 @@ mod tests {
         let (bcast_tx, bcast_rx) = broadcast::channel::<Arc<BroadcastFrame>>(64);
         let (tx, mut rx) = mpsc::channel(64);
 
-        let bcast_tx_clone = bcast_tx.clone();
+        // Signal that resume_from_buffer has been polled at least once so we
+        // know the snapshot + buffer-hit branch has completed and the bridge
+        // is waiting on `bcast_rx`.  Previously this test slept for 10ms,
+        // which flaked under scheduler pressure.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_inner = Arc::clone(&started);
+
         tokio::spawn(async move {
-            // Send one live event after a short delay.
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = bcast_tx_clone.send(make_frame(make_event("6", 6)));
-            drop(bcast_tx_clone);
+            // Yield once so the spawn ordering doesn't depend on
+            // tokio::spawn poll order.
+            tokio::task::yield_now().await;
+            started_inner.notify_one();
         });
 
         tokio::spawn(resume_from_buffer(
@@ -942,8 +948,11 @@ mod tests {
             Arc::new(Notify::new()),
         ));
 
-        // Drop the original sender too so bridge exits after the live event.
-        drop(bcast_tx);
+        // Wait for the resume task to be live; only then push the broadcast
+        // event so we don't race the snapshot collection.
+        started.notified().await;
+        let _ = bcast_tx.send(make_frame(make_event("6", 6)));
+        drop(bcast_tx); // bridge exits after delivering the one live event
 
         let mut received: Vec<u32> = Vec::new();
         while let Some(Ok(ev)) = rx.recv().await {
