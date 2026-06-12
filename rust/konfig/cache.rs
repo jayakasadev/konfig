@@ -60,7 +60,7 @@ impl ConfigCache {
 
     /// Insert or replace the entry for `snap.namespace` / `snap.name`.
     pub fn update(&self, snap: ConfigSnapshot) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
         next.insert(
@@ -72,7 +72,7 @@ impl ConfigCache {
 
     /// Remove the entry for `(namespace, name)` if present.
     pub fn remove(&self, namespace: &str, name: &str) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
         let q = BorrowedKey::new(namespace, name);
@@ -103,7 +103,7 @@ impl ConfigCache {
     /// `stale_since = Some(now)`.  Next `cache.update(snap)` for a fresh
     /// Apply event will insert a snapshot with `stale_since = None`.
     pub fn mark_all_stale(&self) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
         let now = std::time::Instant::now();

@@ -39,7 +39,7 @@ impl SecretCache {
     }
 
     pub fn update(&self, snap: SecretSnapshot) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
         next.insert(
@@ -50,7 +50,7 @@ impl SecretCache {
     }
 
     pub fn remove(&self, namespace: &str, name: &str) {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = crate::sync_util::lock_recovered(&self.write_lock);
         let current = self.inner.load();
         let mut next = (**current).clone();
         let q = BorrowedKey::new(namespace, name);

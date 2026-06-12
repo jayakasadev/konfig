@@ -101,7 +101,7 @@ fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEv
         );
         return;
     };
-    let mut guard = buf.lock().expect("replay buffer poisoned");
+    let mut guard = crate::sync_util::lock_recovered(buf);
     if guard.len() >= REPLAY_BUFFER_SIZE {
         guard.pop_front();
     }
@@ -451,7 +451,7 @@ async fn resume_from_buffer(
     // already sorted by `resource_version_u64`.  Use `binary_search_by_key`
     // (O(log N)) instead of the prior O(N) `position()` scan.
     let (replay_slice, found_in_buffer): (Vec<Arc<ConfigEvent>>, bool) = {
-        let guard = replay_buf.lock().expect("replay buffer poisoned");
+        let guard = crate::sync_util::lock_recovered(&replay_buf);
         let lookup = resume_rv_u64.and_then(|target| {
             guard
                 .binary_search_by_key(&target, |e| e.resource_version_u64)
@@ -523,7 +523,7 @@ async fn resume_from_buffer(
         // RVs are pre-parsed in `ReplayEntry::resource_version_u64`, so this
         // filter is O(N) loads with no string→u64 work.
         let post_snapshot_events: Vec<Arc<ConfigEvent>> = {
-            let guard = replay_buf.lock().expect("replay buffer poisoned");
+            let guard = crate::sync_util::lock_recovered(&replay_buf);
             guard
                 .iter()
                 .filter(|e| e.resource_version_u64 > max_snapshot_rv)
