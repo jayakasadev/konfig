@@ -51,8 +51,23 @@ pub async fn handle_subscribe_secrets(
     let namespace = req.namespace.clone();
     let resume_rv = req.resume_resource_version.clone();
 
+    // Always emit the current cache snapshot first — both empty-rv (fresh
+    // subscriber) and non-empty-rv (resume) paths get a synchronous
+    // known-good state before live events flow.  Resume previously skipped
+    // the snapshot, leaving the client to discover cache state out-of-band
+    // via GetAllSecrets — asymmetric with Config Subscribe.
+    let snapshots = secret_cache.all_in_namespace(&namespace);
+    if !snapshots.is_empty() && !emit_snapshot_events(&tx, &snapshots, "SubscribeSecrets").await {
+        // Slow / disconnected subscriber during snapshot — stream already
+        // carries the RESOURCE_EXHAUSTED frame; just return the receiver.
+        return Ok(Response::new(ReceiverStream::new(rx)));
+    }
+
     if !resume_rv.is_empty() {
         // Resume path: per-subscriber raw watch (broadcast can't share resume points).
+        // After the snapshot above, the raw watch picks up live events from
+        // `resume_rv`; clients dedupe by resource_version because SNAPSHOT
+        // and live MODIFIED events for the same RV will both appear.
         tokio::spawn(run_raw_watch(
             kube_client,
             namespace,
@@ -70,39 +85,42 @@ pub async fn handle_subscribe_secrets(
         ))
     })?;
 
-    // Empty resume_rv: emit current cache state synchronously as SNAPSHOT
-    // events BEFORE bridging to the live broadcast, so a fresh subscriber
-    // never has to wait for the next ApplySecret to receive any state.
-    let snapshots = secret_cache.all_in_namespace(&namespace);
-    if !snapshots.is_empty() {
-        crate::metrics::SUBSCRIBE_SNAPSHOT_EMITTED
-            .with_label_values(&["secret"])
-            .inc();
-        for snap in &snapshots {
-            let event = SecretEvent {
-                event_type: EventType::Snapshot as i32,
-                secret: Some(secret_snapshot_to_proto(snap)),
-            };
-            if let Err(e) = tx.try_send(Ok(event)) {
-                match e {
-                    TrySendError::Full(_) => {
-                        warn!("SubscribeSecrets snapshot: subscriber slow — disconnecting");
-                        let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
-                        return Ok(Response::new(ReceiverStream::new(rx)));
-                    }
-                    TrySendError::Closed(_) => {
-                        info!("SubscribeSecrets snapshot: subscriber disconnected");
-                        return Ok(Response::new(ReceiverStream::new(rx)));
-                    }
-                }
-            }
-        }
-    }
-
     // Bridge: broadcast::Receiver → mpsc::Sender (this subscriber's gRPC stream).
     tokio::spawn(bridge_broadcast(bcast_rx, tx, drain_notify));
 
     Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+/// Emit the cache state as `EventType::Snapshot` events.  Returns `false` if
+/// the subscriber disconnected or was disconnected for being too slow — the
+/// caller should bail out without bridging further events.
+async fn emit_snapshot_events(
+    tx: &mpsc::Sender<Result<SecretEvent, Status>>,
+    snapshots: &[Arc<SecretSnapshot>],
+    label: &'static str,
+) -> bool {
+    crate::metrics::SUBSCRIBE_SNAPSHOT_EMITTED
+        .with_label_values(&["secret"])
+        .inc();
+    for snap in snapshots {
+        let event = SecretEvent {
+            event_type: EventType::Snapshot as i32,
+            secret: Some(secret_snapshot_to_proto(snap)),
+        };
+        match tx.try_send(Ok(event)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                warn!(label, "snapshot: subscriber slow — disconnecting");
+                let _ = tx.try_send(Err(Status::resource_exhausted("subscriber too slow")));
+                return false;
+            }
+            Err(TrySendError::Closed(_)) => {
+                info!(label, "snapshot: subscriber disconnected");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Return a broadcast `Receiver` for `namespace` by subscribing to the shared
@@ -242,6 +260,25 @@ async fn emit_to_mpsc(
     namespace: &str,
 ) -> bool {
     let Some(snap) = parse_secret_object(secret, namespace) else {
+        // `parse_secret_object` returns `None` either because the secret is
+        // not labelled managed (correct: silent skip) or because the secret
+        // object lacks required fields (regression: should be visible).
+        // Distinguish by inspecting the label here so we don't spam logs for
+        // unmanaged secrets the watcher legitimately filters out.
+        let labelled_managed = secret
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(MANAGED_LABEL))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if labelled_managed {
+            warn!(
+                namespace = %namespace,
+                name = %secret.metadata.name.as_deref().unwrap_or("<unknown>"),
+                "SubscribeSecrets: managed secret could not be parsed — dropping event",
+            );
+        }
         return true;
     };
     let secret_event = SecretEvent {
@@ -432,13 +469,21 @@ mod tests {
         while let Some(item) = stream.next().await {
             if let Err(status) = item {
                 assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+                // Strengthen the assertion: bridge must distinguish "lagged"
+                // from "too slow" in the status message so operators can tell
+                // which side fell behind (broadcast ring vs per-subscriber mpsc).
+                assert!(
+                    status.message().contains("lagged") || status.message().contains("too slow"),
+                    "expected lag/too-slow detail in status message, got: {:?}",
+                    status.message(),
+                );
                 got_exhausted = true;
                 break;
             }
         }
         assert!(
             got_exhausted,
-            "expected RESOURCE_EXHAUSTED disconnect for lagged subscriber"
+            "expected RESOURCE_EXHAUSTED disconnect for lagged subscriber",
         );
     }
 
@@ -534,6 +579,81 @@ mod tests {
         assert!(
             mpsc_rx.recv().await.is_none(),
             "drain must close cleanly (no error frame)"
+        );
+    }
+
+    /// `emit_snapshot_events` must SHIP every cache entry as a SNAPSHOT
+    /// event and return `true` (continue) when the subscriber drains
+    /// promptly. Regression test for the resume-path symmetry fix: clients
+    /// reconnecting at a stale RV now get the cache state before live
+    /// events instead of having to call GetAllSecrets separately.
+    #[tokio::test]
+    async fn emit_snapshot_events_ships_every_cache_entry() {
+        use std::time::Duration;
+        let (tx, mut rx) = mpsc::channel::<Result<SecretEvent, Status>>(CHANNEL_CAPACITY);
+        let snapshots = vec![
+            Arc::new(SecretSnapshot {
+                namespace: "trading".into(),
+                name: "api-keys".into(),
+                schema_version: 3,
+                data: Default::default(),
+                resource_version: "rv-001".into(),
+                loaded_at: std::time::Instant::now(),
+            }),
+            Arc::new(SecretSnapshot {
+                namespace: "trading".into(),
+                name: "db-creds".into(),
+                schema_version: 5,
+                data: Default::default(),
+                resource_version: "rv-002".into(),
+                loaded_at: std::time::Instant::now(),
+            }),
+        ];
+
+        let kept_going = emit_snapshot_events(&tx, &snapshots, "test").await;
+        assert!(kept_going, "fast subscriber should not be disconnected");
+
+        let mut received: Vec<(String, i32)> = Vec::new();
+        while let Ok(item) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            match item {
+                Some(Ok(ev)) => {
+                    let name = ev
+                        .secret
+                        .as_ref()
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    received.push((name, ev.event_type));
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(received.len(), 2, "must ship one SNAPSHOT per cache entry");
+        assert!(
+            received
+                .iter()
+                .all(|(_, ty)| *ty == EventType::Snapshot as i32),
+            "every event must be SNAPSHOT",
+        );
+    }
+
+    /// If the subscriber drops mid-snapshot, `emit_snapshot_events` must
+    /// stop iterating and return `false` so the caller bails out.
+    #[tokio::test]
+    async fn emit_snapshot_events_returns_false_on_closed_receiver() {
+        let (tx, rx) = mpsc::channel::<Result<SecretEvent, Status>>(CHANNEL_CAPACITY);
+        drop(rx); // immediate disconnect
+        let snapshots = vec![Arc::new(SecretSnapshot {
+            namespace: "trading".into(),
+            name: "api-keys".into(),
+            schema_version: 1,
+            data: Default::default(),
+            resource_version: "rv-001".into(),
+            loaded_at: std::time::Instant::now(),
+        })];
+        let kept_going = emit_snapshot_events(&tx, &snapshots, "test").await;
+        assert!(
+            !kept_going,
+            "closed receiver must yield false so caller bails",
         );
     }
 }
