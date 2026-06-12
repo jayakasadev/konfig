@@ -173,7 +173,7 @@ impl Watcher {
                         cache.mark_all_stale();
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;
-                        attempt += 1;
+                        attempt = attempt.saturating_add(1);
                         break;
                     }
                 }

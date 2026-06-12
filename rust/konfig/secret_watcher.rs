@@ -112,11 +112,18 @@ async fn run_namespace_watcher(
                         schema_version = snap.schema_version,
                         "Secret applied",
                     );
-                    cache.update(snap.clone());
+                    // Build the broadcast event from `&snap` first, then move
+                    // `snap` into the cache.  Previously the cache was
+                    // updated with `snap.clone()` and the event borrowed
+                    // `&snap`, doubling the per-event clone work (cache
+                    // owns its own Arc + we cloned the SecretSnapshot
+                    // upfront just to keep the value around for the proto
+                    // build).
                     let secret_event = SecretEvent {
                         event_type: EventType::Modified as i32,
                         secret: Some(secret_snapshot_to_proto(&snap)),
                     };
+                    cache.update(snap);
                     // Ignore Err — means zero receivers at the moment.
                     let _ = broadcast_tx.send(secret_event);
                 }
