@@ -100,6 +100,7 @@ fn parse_configmap(cm: &ConfigMap, namespace: &str) -> Option<ConfigSnapshot> {
         resource_version,
         loaded_at: std::time::Instant::now(),
         stale_since: None,
+        ..Default::default()
     })
 }
 

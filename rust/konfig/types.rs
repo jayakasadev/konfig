@@ -3,6 +3,7 @@
 //! `ConfigSpec` — deserialized from the CRD spec field.
 //! `ConfigSnapshot` — owned cache entry; no borrows, Send + 'static.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,13 @@ pub struct ConfigSpec {
 /// Owned snapshot stored in `ConfigCache`.
 ///
 /// All fields are `Clone` + `Send` + `'static` — safe for `ArcSwap`.
+///
+/// `content_json_cache` memoises the result of serialising `content` once
+/// per snapshot.  Without the cache, every `grpc::snapshot_to_proto` call
+/// re-serialised the JSON payload, which becomes per-event work on the
+/// `Subscribe` hot path.  The cache is wrapped in `Arc<OnceLock<_>>` so
+/// `Clone` (and `Arc<ConfigSnapshot>` fan-out) share the same memoised
+/// string across all clones.
 #[derive(Debug, Clone)]
 pub struct ConfigSnapshot {
     pub name: String,
@@ -54,6 +62,14 @@ pub struct ConfigSnapshot {
     /// All snapshots in the cache share the same stale instant (set by
     /// `ConfigCache::mark_all_stale` when the watcher disconnects).
     pub stale_since: Option<Instant>,
+    /// Memoised JSON encoding of `content`.  Reset on every `Clone` would
+    /// be wasteful, so we put it behind `Arc<OnceLock<…>>`: clones share
+    /// the same cell and the first reader wins.  Public to keep struct-
+    /// literal construction simple at call-sites; do not write to it
+    /// directly — go through [`Self::content_json`] or replace the whole
+    /// snapshot.  `OnceLock`'s single-write semantics make stale-cache
+    /// bugs impossible in practice.
+    pub content_json_cache: Arc<OnceLock<String>>,
 }
 
 impl Default for ConfigSnapshot {
@@ -66,6 +82,7 @@ impl Default for ConfigSnapshot {
             resource_version: String::new(),
             loaded_at: Instant::now(),
             stale_since: None,
+            content_json_cache: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -85,12 +102,19 @@ impl ConfigSnapshot {
             resource_version,
             loaded_at: Instant::now(),
             stale_since: None,
+            content_json_cache: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Serialize content to JSON string for the gRPC wire.
-    pub fn content_json(&self) -> String {
-        serde_json::to_string(&self.content).unwrap_or_default()
+    /// Serialise `content` once per snapshot and return the cached string.
+    ///
+    /// Returns `&str` to encourage callers to clone at the proto boundary
+    /// instead of re-serialising.  Callers that need an owned `String`
+    /// (gRPC proto fields are `String`) do a single `.to_owned()` — the
+    /// per-RPC serialisation work disappears.
+    pub fn content_json(&self) -> &str {
+        self.content_json_cache
+            .get_or_init(|| serde_json::to_string(&self.content).unwrap_or_default())
     }
 }
 
@@ -156,7 +180,41 @@ mod tests {
             ..Default::default()
         };
         let json_str = snap.content_json();
-        let reparsed: Value = serde_json::from_str(&json_str).unwrap();
+        let reparsed: Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(reparsed["a"], 1);
+    }
+
+    /// Repeated `content_json()` calls must return the same memoised string,
+    /// not a freshly serialised one. Checking pointer identity proves the
+    /// `OnceLock` cache is wired up correctly.
+    #[test]
+    fn content_json_is_memoised() {
+        let snap = ConfigSnapshot {
+            schema_version: 1,
+            content: json!({"k": "v"}),
+            ..Default::default()
+        };
+        let p1 = snap.content_json().as_ptr();
+        let p2 = snap.content_json().as_ptr();
+        assert_eq!(
+            p1, p2,
+            "content_json must return cached string on second call"
+        );
+    }
+
+    /// Clones of a snapshot must share the same memoised JSON cache —
+    /// `Arc<OnceLock<…>>` lets one clone's `content_json()` populate the
+    /// cache and a different clone see the result without re-serialising.
+    #[test]
+    fn content_json_cache_is_shared_across_clones() {
+        let snap_a = ConfigSnapshot {
+            schema_version: 1,
+            content: json!({"k": "v"}),
+            ..Default::default()
+        };
+        let snap_b = snap_a.clone();
+        let p_a = snap_a.content_json().as_ptr();
+        let p_b = snap_b.content_json().as_ptr();
+        assert_eq!(p_a, p_b, "clones must share the same OnceLock cell");
     }
 }
