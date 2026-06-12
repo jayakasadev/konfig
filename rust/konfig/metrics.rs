@@ -392,16 +392,13 @@ impl LastEventAt {
 
     /// Record that an event was just received.
     pub fn touch(&self) {
-        *self.0.lock().expect("LastEventAt poisoned") = Some(Instant::now());
+        *crate::sync_util::lock_recovered(&self.0) = Some(Instant::now());
     }
 
     /// Seconds since the last event, or `None` if no event has been received
     /// yet (cold start — the sampler treats this as "fresh" / `0.0`).
     pub fn elapsed_secs(&self) -> Option<f64> {
-        self.0
-            .lock()
-            .expect("LastEventAt poisoned")
-            .map(|t| t.elapsed().as_secs_f64())
+        crate::sync_util::lock_recovered(&self.0).map(|t| t.elapsed().as_secs_f64())
     }
 }
 

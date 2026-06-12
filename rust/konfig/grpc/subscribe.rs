@@ -81,7 +81,7 @@ pub type ReplayBuffer = Arc<Mutex<VecDeque<ReplayEntry>>>;
 
 /// Push `event` into `buf`, evicting the oldest entry when the buffer is full.
 fn push_replay(buf: &ReplayBuffer, resource_version: String, event: Arc<ConfigEvent>) {
-    let mut guard = buf.lock().expect("replay buffer poisoned");
+    let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
     if guard.len() >= REPLAY_BUFFER_SIZE {
         guard.pop_front();
     }
@@ -385,7 +385,7 @@ async fn resume_from_buffer(
     // Also record whether resume_rv was found in the buffer.
     // Arc clones are reference-count increments only — no deep copy of event data.
     let (replay_slice, found_in_buffer): (Vec<Arc<ConfigEvent>>, bool) = {
-        let guard = replay_buf.lock().expect("replay buffer poisoned");
+        let guard = replay_buf.lock().unwrap_or_else(|e| e.into_inner());
         match guard.iter().position(|e| e.resource_version == resume_rv) {
             Some(idx) => {
                 let slice: Vec<Arc<ConfigEvent>> = guard
@@ -460,7 +460,7 @@ async fn resume_from_buffer(
 
         // Collect Arc clones under the lock, then release before any await.
         let post_snapshot_events: Vec<Arc<ConfigEvent>> = {
-            let guard = replay_buf.lock().expect("replay buffer poisoned");
+            let guard = replay_buf.lock().unwrap_or_else(|e| e.into_inner());
             guard
                 .iter()
                 .filter(|e| e.resource_version.parse::<u64>().unwrap_or(0) > max_snapshot_rv)
