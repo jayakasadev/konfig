@@ -12,6 +12,7 @@
 //! - [`import`] — CLI helper: onboard existing ConfigMaps as Config CRDs
 
 pub mod cache;
+pub mod cache_key;
 pub mod configmap_watcher;
 pub mod grpc;
 pub mod import;
